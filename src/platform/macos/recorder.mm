@@ -241,6 +241,9 @@ public:
                 if (audio_dispatch_queue_) dispatch_sync(audio_dispatch_queue_, ^{});
                 cleanup_capture();
             }
+            // Append audio delivered just before SCK stopped, before closing the AAC input.
+            if (options_.system_audio && writer_ &&
+                writer_.status == AVAssetWriterStatusWriting) write_system_audio();
             if (writer_) {
                 if (writer_.status == AVAssetWriterStatusWriting) {
                     [input_ markAsFinished];
