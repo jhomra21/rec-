@@ -2,7 +2,7 @@
 
 A compact screen recorder for macOS, built with C++20 and Apple's capture and video encoding frameworks.
 
-This is the first implementation, not feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs). It records one display to a `.mov` or `.mp4` file with H.264 or HEVC. It does not capture audio yet. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
+Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the first implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC. It does not capture audio yet. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
 
 ## Build
 
@@ -33,21 +33,19 @@ The `--test-pattern` capture path bypasses desktop permission and encodes a real
 
 `rec probe file.mov` reports decoded frames, dimensions, codec, and duration.
 
-
-
 ```sh
 ./scripts/smoke.sh
 REC_E2E_CAPTURE=1 ./scripts/smoke.sh
 ```
 
-The first command builds and checks the CLI contract. The second records a short real screen capture on macOS. If `ffprobe` is installed, it also checks the output video codec, frame count and dimensions. This is an end-to-end check, not a substitute for long-duration sync or quality measurement.
+The first command builds, encodes real synthetic H.264 and HEVC movies through VideoToolbox, decodes them through AVFoundation, checks every frame's timestamp ordering and validates the exact frame count and codec. The second additionally captures a real screen with Screen Recording permission. CI publishes the synthetic video files and probe reports as a downloadable workflow artifact. These checks are not a substitute for longer A/V sync and performance measurements.
 
 ## Current limits
 
 - Capture is display-only and video-only.
-- The file writer currently drops an output frame when the hardware encoder is backpressured. Drops are counted. Retrying a bounded backlog is a follow-up before performance comparisons.
+- The file writer retries transient encoder backpressure for up to 500 ms per timestamp. Overload beyond that deadline may drop frames; drops are counted and must be evaluated under stress.
 - ScreenCaptureKit performs scaling for non-native output. GPU Lanczos quality is future work.
 - Capturing and encoding with macOS cannot be verified on a Linux host. See the CI workflow for the macOS build and smoke gate.
 - There are no credible CPU, RAM, binary-size or quality comparisons with rec-rs yet.
 
-The architecture rules and studied references are in [AGENTS.md](AGENTS.md).
+See [the parity and E2E acceptance tracker](docs/parity.md) for the remaining features and evidence required before release. Architecture rules and studied references are in [AGENTS.md](AGENTS.md).
