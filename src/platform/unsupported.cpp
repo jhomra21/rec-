@@ -1,0 +1,17 @@
+#include "rec/rec.hpp"
+
+namespace rec {
+std::vector<Display> list_displays(std::string& error) {
+    error = "screen capture requires macOS 15 or newer";
+    return {};
+}
+class Recorder::Impl {};
+Recorder::Recorder(Options) : impl_(std::make_unique<Impl>()) {}
+Recorder::~Recorder() = default;
+Result Recorder::start() { return {"screen capture requires macOS 15 or newer"}; }
+Result Recorder::stop() { return {}; }
+bool Recorder::running() const noexcept { return false; }
+bool Recorder::finished() const noexcept { return true; }
+Stats Recorder::stats() const noexcept { return {}; }
+std::string Recorder::failure() const { return {}; }
+} // namespace rec

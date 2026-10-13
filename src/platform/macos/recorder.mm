@@ -1,0 +1,358 @@
+#import <AVFoundation/AVFoundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+
+#include "rec/rec.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+namespace rec {
+void receive_frame(void* owner, CMSampleBufferRef sample);
+void receive_failure(void* owner, NSError* error);
+}
+
+@interface RecCaptureOutput : NSObject <SCStreamOutput, SCStreamDelegate>
+@property(nonatomic, assign) void* owner;
+@end
+
+@implementation RecCaptureOutput
+- (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)buffer
+       ofType:(SCStreamOutputType)type {
+    (void)stream;
+    if (self.owner && type == SCStreamOutputTypeScreen) rec::receive_frame(self.owner, buffer);
+}
+- (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
+    (void)stream;
+    if (self.owner) rec::receive_failure(self.owner, error);
+}
+@end
+
+namespace rec {
+namespace {
+std::string message(NSError* error, const char* fallback) {
+    return error ? std::string(error.localizedDescription.UTF8String ?: fallback) : std::string(fallback);
+}
+
+SCShareableContent* shareable(std::string& error) {
+    __block SCShareableContent* content = nil;
+    __block NSError* reported = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent* found, NSError* e) {
+        content = found;
+        reported = e;
+        dispatch_semaphore_signal(done);
+    }];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) {
+        error = "ScreenCaptureKit did not return shareable content in 10 seconds";
+        return nil;
+    }
+    if (!content) error = message(reported, "ScreenCaptureKit could not list displays. Check Screen Recording permission.");
+    return content;
+}
+
+struct Size { std::uint32_t width, height; };
+
+Size output_size(Options options, SCDisplay* display) {
+    auto mode = CGDisplayCopyDisplayMode(display.displayID);
+    const std::uint32_t native_w = mode ? static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode)) : display.width;
+    const std::uint32_t native_h = mode ? static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode)) : display.height;
+    if (mode) CGDisplayModeRelease(mode);
+    if (!options.width || !options.height) return {native_w & ~1u, native_h & ~1u};
+    const double factor = std::min({1.0, static_cast<double>(options.width) / native_w,
+                                    static_cast<double>(options.height) / native_h});
+    return {std::max(2u, static_cast<std::uint32_t>(native_w * factor) & ~1u),
+            std::max(2u, static_cast<std::uint32_t>(native_h * factor) & ~1u)};
+}
+
+Result wait_capture(SCStream* stream, bool start) {
+    __block NSError* reported = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    void (^completion)(NSError*) = ^(NSError* error) {
+        reported = error;
+        dispatch_semaphore_signal(done);
+    };
+    if (start) [stream startCaptureWithCompletionHandler:completion];
+    else [stream stopCaptureWithCompletionHandler:completion];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)))
+        return {start ? "screen capture start timed out" : "screen capture stop timed out"};
+    return reported ? Result{message(reported, "screen capture failed")} : Result{};
+}
+} // namespace
+
+std::vector<Display> list_displays(std::string& error) {
+    @autoreleasepool {
+        error.clear();
+        SCShareableContent* content = shareable(error);
+        if (!content) return {};
+        std::vector<Display> result;
+        for (SCDisplay* display in content.displays) {
+            auto size = output_size(Options{.width = 0, .height = 0}, display);
+            result.push_back({display.displayID, size.width, size.height,
+                              "Display " + std::to_string(display.displayID)});
+        }
+        return result;
+    }
+}
+
+// One retained surface and one encoding thread. The SCK callback never waits for the encoder.
+class CaptureState {
+public:
+    explicit CaptureState(Options options) : options_(std::move(options)) {}
+    ~CaptureState() { stop(); }
+
+    Result start() {
+        @autoreleasepool {
+            if (active_) return {"already recording"};
+            std::string error;
+            SCShareableContent* content = shareable(error);
+            if (!content) return {error};
+            if (options_.display > content.displays.count) return {"display index not found; run `rec devices`"};
+            SCDisplay* display = content.displays[options_.display - 1];
+            size_ = output_size(options_, display);
+            if (!size_.width || !size_.height) return {"display has no usable pixel dimensions"};
+            if (options_.output.empty()) return {"output path is empty"};
+            NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path])
+                return {"output file already exists: " + options_.output};
+
+            SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+            SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
+            config.width = size_.width;
+            config.height = size_.height;
+            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            config.minimumFrameInterval = CMTimeMake(9, static_cast<int32_t>(options_.fps * 10));
+            config.queueDepth = 3;
+            config.showsCursor = options_.cursor;
+            config.capturesAudio = NO;
+            config.scalesToFit = YES;
+            config.preservesAspectRatio = YES;
+            receiver_ = [[RecCaptureOutput alloc] init];
+            receiver_.owner = this;
+            queue_ = dispatch_queue_create("rec.capture.frames", DISPATCH_QUEUE_SERIAL);
+            stream_ = [[SCStream alloc] initWithFilter:filter configuration:config delegate:receiver_];
+            NSError* streamError = nil;
+            if (![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeScreen
+                      sampleHandlerQueue:queue_ error:&streamError]) {
+                error = message(streamError, "could not subscribe to screen frames");
+                cleanup_capture();
+                return {error};
+            }
+            auto started = wait_capture(stream_, true);
+            if (!started) { cleanup_capture(); return started; }
+            active_ = true;
+            {
+                std::unique_lock lock(mutex_);
+                if (!frames_ready_.wait_for(lock, std::chrono::seconds(8), [this] {
+                    return newest_ != nullptr || !failure_.empty();
+                })) {
+                    error = "no screen frames arrived within 8 seconds (check Screen Recording permission)";
+                } else if (!failure_.empty()) {
+                    error = failure_;
+                }
+            }
+            if (!error.empty()) { stop(); return {error}; }
+            auto ready = create_writer();
+            if (!ready) { stop(); return ready; }
+            activity_ = [[NSProcessInfo processInfo]
+                beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                reason:@"Screen recording"];
+            finished_.store(false);
+            pacer_ = std::jthread([this](std::stop_token token) { run(token); });
+            return {};
+        }
+    }
+
+    Result stop() {
+        @autoreleasepool {
+            if (pacer_.joinable()) { pacer_.request_stop(); pacer_.join(); }
+            Result result;
+            if (stream_) {
+                if (active_) result = wait_capture(stream_, false);
+                // Drain callbacks before clearing their unowned C++ pointer.
+                if (queue_) dispatch_sync(queue_, ^{});
+                cleanup_capture();
+            }
+            if (writer_) {
+                if (writer_.status == AVAssetWriterStatusWriting) {
+                    [input_ markAsFinished];
+                    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+                    [writer_ finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
+                    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)))
+                        result = {"timed out finalizing the recording"};
+                }
+                if (writer_.status == AVAssetWriterStatusFailed)
+                    result = {message(writer_.error, "video writer failed")};
+                adaptor_ = nil;
+                input_ = nil;
+                writer_ = nil;
+            }
+            if (activity_) { [[NSProcessInfo processInfo] endActivity:activity_]; activity_ = nil; }
+            {
+                std::lock_guard lock(mutex_);
+                if (newest_) { CVPixelBufferRelease(newest_); newest_ = nullptr; }
+            }
+            active_ = false;
+            return result;
+        }
+    }
+
+    void on_frame(CMSampleBufferRef sample) {
+        if (!CMSampleBufferIsValid(sample)) return;
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
+        if (attachments && CFArrayGetCount(attachments) > 0) {
+            NSDictionary* info = (__bridge NSDictionary*)CFArrayGetValueAtIndex(attachments, 0);
+            NSNumber* status = info[SCStreamFrameInfoStatus];
+            if (status && status.integerValue != SCFrameStatusComplete) return;
+        }
+        CVPixelBufferRef pixel = (CVPixelBufferRef)CMSampleBufferGetImageBuffer(sample);
+        if (!pixel) return;
+        CVPixelBufferRetain(pixel);
+        {
+            std::lock_guard lock(mutex_);
+            auto* old = newest_;
+            newest_ = pixel;
+            if (old) CVPixelBufferRelease(old);
+            captured_.fetch_add(1, std::memory_order_relaxed);
+        }
+        frames_ready_.notify_one();
+    }
+
+    void on_failure(NSError* error) {
+        {
+            std::lock_guard lock(mutex_);
+            failure_ = message(error, "screen capture stopped unexpectedly");
+        }
+        finished_.store(true);
+        frames_ready_.notify_one();
+    }
+
+    bool running() const noexcept { return active_ && !finished_.load(); }
+    bool finished() const noexcept { return finished_.load(); }
+    Stats stats() const noexcept { return {captured_.load(), written_.load(), dropped_.load()}; }
+    std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
+
+private:
+    Result create_writer() {
+        NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
+        NSURL* url = [NSURL fileURLWithPath:path];
+        AVFileType type = [path.pathExtension.lowercaseString isEqualToString:@"mp4"]
+            ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+        NSError* error = nil;
+        writer_ = [[AVAssetWriter alloc] initWithURL:url fileType:type error:&error];
+        if (!writer_) return {message(error, "could not create output movie")};
+        bool hevc = options_.codec == Codec::hevc ||
+            (options_.codec == Codec::automatic && size_.height > 1080);
+        const std::uint64_t bitrate = static_cast<std::uint64_t>(options_.bitrate_mbps ?
+            options_.bitrate_mbps : (size_.height > 1440 ? 50 : size_.height > 1080 ? 30 : 20)) * 1000000;
+        NSDictionary* settings = @{
+            AVVideoCodecKey: hevc ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
+            AVVideoWidthKey: @(size_.width), AVVideoHeightKey: @(size_.height),
+            AVVideoCompressionPropertiesKey: @{
+                AVVideoAverageBitRateKey: @(bitrate),
+                AVVideoExpectedSourceFrameRateKey: @(options_.fps),
+                AVVideoMaxKeyFrameIntervalKey: @(options_.fps * 2),
+                AVVideoAllowFrameReorderingKey: @NO
+            }
+        };
+        input_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:settings];
+        input_.expectsMediaDataInRealTime = YES;
+        if (![writer_ canAddInput:input_]) return {"video encoder cannot accept the selected settings"};
+        [writer_ addInput:input_];
+        // No adaptor pool: SCK's IOSurface-backed pixel buffer goes to VideoToolbox unchanged.
+        adaptor_ = [AVAssetWriterInputPixelBufferAdaptor
+            assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input_ sourcePixelBufferAttributes:nil];
+        if (![writer_ startWriting]) return {message(writer_.error, "video writer could not start")};
+        [writer_ startSessionAtSourceTime:kCMTimeZero];
+        return {};
+    }
+
+    void run(std::stop_token token) {
+        using namespace std::chrono;
+        const auto begin = steady_clock::now();
+        const auto limit = options_.duration_seconds > 0
+            ? static_cast<std::uint64_t>(std::llround(options_.duration_seconds * options_.fps)) : UINT64_MAX;
+        for (std::uint64_t slot = 0; slot < limit && !token.stop_requested() && !finished_; ++slot) {
+            const auto tick = begin + nanoseconds(slot * 1000000000ull / options_.fps);
+            std::this_thread::sleep_until(tick);
+            if (token.stop_requested() || finished_) break;
+            @autoreleasepool {
+                CVPixelBufferRef frame = nullptr;
+                {
+                    std::lock_guard lock(mutex_);
+                    frame = newest_;
+                    if (frame) CVPixelBufferRetain(frame);
+                }
+                if (!frame || !input_.readyForMoreMediaData ||
+                    ![adaptor_ appendPixelBuffer:frame withPresentationTime:CMTimeMake(static_cast<int64_t>(slot), static_cast<int32_t>(options_.fps))]) {
+                    dropped_.fetch_add(1);
+                    if (writer_.status == AVAssetWriterStatusFailed) {
+                        std::lock_guard lock(mutex_);
+                        failure_ = message(writer_.error, "video encoding failed");
+                        finished_.store(true);
+                    }
+                } else {
+                    written_.fetch_add(1);
+                }
+                if (frame) CVPixelBufferRelease(frame);
+            }
+        }
+        finished_.store(true);
+    }
+
+    void cleanup_capture() {
+        if (receiver_) receiver_.owner = nullptr;
+        receiver_ = nil;
+        stream_ = nil;
+        queue_ = nil;
+    }
+
+    Options options_;
+    Size size_{};
+    mutable std::mutex mutex_;
+    std::condition_variable frames_ready_;
+    CVPixelBufferRef newest_ = nullptr;
+    std::string failure_;
+    SCStream* __strong stream_ = nil;
+    RecCaptureOutput* __strong receiver_ = nil;
+    dispatch_queue_t queue_ = nullptr;
+    AVAssetWriter* __strong writer_ = nil;
+    AVAssetWriterInput* __strong input_ = nil;
+    AVAssetWriterInputPixelBufferAdaptor* __strong adaptor_ = nil;
+    id __strong activity_ = nil;
+    std::jthread pacer_;
+    std::atomic_bool active_{false};
+    std::atomic_bool finished_{false};
+    std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0};
+};
+
+void receive_frame(void* owner, CMSampleBufferRef sample) {
+    static_cast<CaptureState*>(owner)->on_frame(sample);
+}
+void receive_failure(void* owner, NSError* error) {
+    static_cast<CaptureState*>(owner)->on_failure(error);
+}
+
+class Recorder::Impl {
+public:
+    explicit Impl(Options options) : capture(std::move(options)) {}
+    CaptureState capture;
+};
+Recorder::Recorder(Options options) : impl_(std::make_unique<Impl>(std::move(options))) {}
+Recorder::~Recorder() = default;
+Result Recorder::start() { return impl_->capture.start(); }
+Result Recorder::stop() { return impl_->capture.stop(); }
+bool Recorder::running() const noexcept { return impl_->capture.running(); }
+bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
+Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }
+std::string Recorder::failure() const { return impl_->capture.failure(); }
+
+} // namespace rec
