@@ -7,5 +7,15 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Build and verify CLI
+      - name: Build, encode, and decode real VideoToolbox output
+        env:
+          REC_E2E_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
         run: ./scripts/smoke.sh
+      - name: Preserve E2E recordings and probe reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rec-macos-e2e
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
