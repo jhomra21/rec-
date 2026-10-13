@@ -20,6 +20,7 @@ struct Options {
     bool cursor = true;
     bool test_pattern = false; // Synthetic frame, for hardware-encoder E2E without screen permission.
     bool test_tone = false; // Synthetic 48 kHz stereo tone with AAC encoding (requires test_pattern).
+    bool system_audio = false; // Opt-in ScreenCaptureKit system audio, 48 kHz stereo AAC.
     double duration_seconds = 10.0; // 0 = until stop()
 };
 
@@ -34,6 +35,8 @@ struct Stats {
     std::uint64_t captured = 0;
     std::uint64_t written = 0;
     std::uint64_t dropped = 0;
+    std::uint64_t audio_written = 0;
+    std::uint64_t audio_dropped = 0;
 };
 
 struct Probe {
