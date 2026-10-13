@@ -166,14 +166,15 @@ public:
                 beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
                 reason:@"Screen recording"];
             finished_.store(false);
-            pacer_ = std::jthread([this](std::stop_token token) { run(token); });
+            stop_requested_.store(false);
+            pacer_ = std::thread([this] { run(); });
             return {};
         }
     }
 
     Result stop() {
         @autoreleasepool {
-            if (pacer_.joinable()) { pacer_.request_stop(); pacer_.join(); }
+            if (pacer_.joinable()) { stop_requested_.store(true); pacer_.join(); }
             Result result;
             if (stream_) {
                 if (active_) result = wait_capture(stream_, false);
@@ -275,15 +276,15 @@ private:
         return {};
     }
 
-    void run(std::stop_token token) {
+    void run() {
         using namespace std::chrono;
         const auto begin = steady_clock::now();
         const auto limit = options_.duration_seconds > 0
             ? static_cast<std::uint64_t>(std::llround(options_.duration_seconds * options_.fps)) : UINT64_MAX;
-        for (std::uint64_t slot = 0; slot < limit && !token.stop_requested() && !finished_; ++slot) {
+        for (std::uint64_t slot = 0; slot < limit && !stop_requested_.load() && !finished_; ++slot) {
             const auto tick = begin + nanoseconds(slot * 1000000000ull / options_.fps);
             std::this_thread::sleep_until(tick);
-            if (token.stop_requested() || finished_) break;
+            if (stop_requested_.load() || finished_) break;
             @autoreleasepool {
                 CVPixelBufferRef frame = nullptr;
                 {
@@ -328,7 +329,8 @@ private:
     AVAssetWriterInput* __strong input_ = nil;
     AVAssetWriterInputPixelBufferAdaptor* __strong adaptor_ = nil;
     id __strong activity_ = nil;
-    std::jthread pacer_;
+    std::thread pacer_;
+    std::atomic_bool stop_requested_{false};
     std::atomic_bool active_{false};
     std::atomic_bool finished_{false};
     std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0};
