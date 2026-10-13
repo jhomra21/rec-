@@ -42,6 +42,14 @@ Opt in to system audio on a Mac with Screen Recording permission:
 
 System audio goes through ScreenCaptureKit's own audio stream and an explicitly bounded 16-buffer queue. The recorder retimes audio samples to its host-clock recording origin before passing them to AVAssetWriter. The CLI reports written and dropped audio buffers. This is not yet proof of live A/V sync; test with playing audio and inspect decoded output before relying on the feature.
 
+For a repeatable permissioned-device capture, run:
+
+```sh
+bash scripts/e2e-live-audio.sh
+```
+
+The script generates a known WAV stimulus, plays it with `afplay` during an eight-second ScreenCaptureKit recording, decodes the movie's AAC track, and leaves the movie, stimulus, logs, and probe report in a temporary evidence directory. This tests audio presence and decoding, not a precise flash/beep offset. It needs a Mac with audible system output and screen-recording permission.
+
 ```sh
 ./scripts/smoke.sh
 REC_E2E_CAPTURE=1 ./scripts/smoke.sh
