@@ -31,7 +31,8 @@ void usage() {
                  "  --bitrate MBPS           Target megabits/second (0 = automatic)\n"
                  "  --no-cursor              Do not record the cursor\n"
                  "  --test-pattern           Synthetic encode (no screen permission)\n"
-                 "  --test-tone              Add synthetic AAC audio to test pattern\n";
+                 "  --test-tone              Add synthetic AAC audio to test pattern\n"
+                 "  --system-audio           Record macOS system audio (opt-in)\n";
 }
 
 bool integer(std::string_view s, std::uint32_t& out) {
@@ -53,6 +54,7 @@ bool parse(int argc, char** argv, rec::Options& o, std::string& error) {
         if (arg == "--no-cursor") { o.cursor = false; continue; }
         if (arg == "--test-pattern") { o.test_pattern = true; continue; }
         if (arg == "--test-tone") { o.test_tone = true; continue; }
+        if (arg == "--system-audio") { o.system_audio = true; continue; }
         if (i + 1 >= argc) { error = "missing value for " + std::string(arg); return false; }
         std::string_view value(argv[++i]);
         if (arg == "-o" || arg == "--output") o.output = value;
@@ -80,6 +82,7 @@ bool parse(int argc, char** argv, rec::Options& o, std::string& error) {
         } else { error = "unknown option: " + std::string(arg); return false; }
     }
     if (o.test_tone && !o.test_pattern) { error = "--test-tone requires --test-pattern"; return false; }
+    if (o.system_audio && o.test_pattern) { error = "--system-audio needs a real screen capture"; return false; }
     if (o.output.empty() || (o.output.size() < 4 ||
         (o.output.substr(o.output.size() - 4) != ".mov" && o.output.substr(o.output.size() - 4) != ".mp4"))) {
         error = "output must end with .mov or .mp4";
@@ -136,7 +139,8 @@ int main(int argc, char** argv) {
     const auto stopped = recorder.stop();
     const auto stats = recorder.stats();
     std::cout << "Captured " << stats.captured << ", written " << stats.written
-              << ", dropped " << stats.dropped << '\n';
+              << ", dropped " << stats.dropped << "\nAudio buffers written " << stats.audio_written
+              << ", dropped " << stats.audio_dropped << '\n';
     if (!stopped) { std::cerr << stopped.error << '\n'; return 1; }
     if (!recorder.failure().empty()) { std::cerr << recorder.failure() << '\n'; return 1; }
     std::cout << "Saved " << options.output << '\n';
