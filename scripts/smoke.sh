@@ -36,6 +36,14 @@ else
   grep -qx 'frames=60' "$artifacts/h264.probe"
   grep -q 'written 60, dropped 0' "$artifacts/h264.record.log"
 
+  "$rec" record --test-pattern --test-tone -r 1080p -f 30 -t 2 --codec h264 -o "$artifacts/av.mov" | tee "$artifacts/av.record.log"
+  "$rec" probe "$artifacts/av.mov" | tee "$artifacts/av.probe"
+  grep -qx 'codec=h264' "$artifacts/av.probe"
+  grep -qx 'frames=60' "$artifacts/av.probe"
+  grep -qx 'audio_codec=aac' "$artifacts/av.probe"
+  grep -q 'written 60, dropped 0' "$artifacts/av.record.log"
+  awk -F= '/^audio_duration=/{ if ($2 < 1.95 || $2 > 2.05) exit 1; found=1 } END { if (!found) exit 1 }' "$artifacts/av.probe"
+
   "$rec" record --test-pattern -r 1080p -f 30 -t 1 --codec hevc -o "$artifacts/hevc.mp4" | tee "$artifacts/hevc.record.log"
   "$rec" probe "$artifacts/hevc.mp4" | tee "$artifacts/hevc.probe"
   grep -qx 'codec=hevc' "$artifacts/hevc.probe"

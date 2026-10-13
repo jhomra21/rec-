@@ -2,7 +2,7 @@
 
 A compact screen recorder for macOS, built with C++20 and Apple's capture and video encoding frameworks.
 
-Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the first implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC. It does not capture audio yet. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
+Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the first implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC. It does not capture live audio yet; a synthetic AAC tone is available for E2E verification. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
 
 ## Build
 
@@ -31,7 +31,7 @@ You can stop an unlimited recording with Ctrl-C:
 
 The `--test-pattern` capture path bypasses desktop permission and encodes a real synthetic NV12 video using VideoToolbox. On macOS, the smoke command also runs `rec probe` to decode every frame using AVFoundation, verify the codec and frame count, and check monotonic timestamps. Screen recording permission is still needed to validate a real display.
 
-`rec probe file.mov` reports decoded frames, dimensions, codec, and duration.
+`rec probe file.mov` reports decoded frames, dimensions, codec, duration, and audio-track properties if present. Use `--test-pattern --test-tone` to exercise AAC encoding and decoding without microphone or desktop permissions.
 
 ```sh
 ./scripts/smoke.sh

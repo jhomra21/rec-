@@ -19,6 +19,7 @@ struct Options {
     Codec codec = Codec::automatic;
     bool cursor = true;
     bool test_pattern = false; // Synthetic frame, for hardware-encoder E2E without screen permission.
+    bool test_tone = false; // Synthetic 48 kHz stereo tone with AAC encoding (requires test_pattern).
     double duration_seconds = 10.0; // 0 = until stop()
 };
 
@@ -41,6 +42,9 @@ struct Probe {
     std::uint32_t height = 0;
     double duration_seconds = 0;
     std::string codec;
+    std::string audio_codec;
+    std::uint64_t audio_buffers = 0;
+    double audio_duration_seconds = 0;
 };
 
 struct Result {

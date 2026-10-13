@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace rec {
 void receive_frame(void* owner, CMSampleBufferRef sample);
@@ -114,6 +116,7 @@ public:
         @autoreleasepool {
             if (active_) return {"already recording"};
             if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
+            if (options_.test_tone && !options_.test_pattern) return {"test tone needs test pattern"};
             std::string error;
             if (options_.output.empty()) return {"output path is empty"};
             NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
@@ -222,6 +225,7 @@ public:
             if (writer_) {
                 if (writer_.status == AVAssetWriterStatusWriting) {
                     [input_ markAsFinished];
+                    if (audio_input_) [audio_input_ markAsFinished];
                     dispatch_semaphore_t done = dispatch_semaphore_create(0);
                     [writer_ finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
                     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)))
@@ -230,6 +234,7 @@ public:
                 if (writer_.status == AVAssetWriterStatusFailed)
                     result = {message(writer_.error, "video writer failed")};
                 adaptor_ = nil;
+                audio_input_ = nil;
                 input_ = nil;
                 writer_ = nil;
             }
@@ -305,12 +310,89 @@ private:
         input_.expectsMediaDataInRealTime = YES;
         if (![writer_ canAddInput:input_]) return {"video encoder cannot accept the selected settings"};
         [writer_ addInput:input_];
+        if (options_.test_tone) {
+            NSDictionary* audioSettings = @{
+                AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+                AVSampleRateKey: @48000,
+                AVNumberOfChannelsKey: @2,
+                AVEncoderBitRateKey: @192000
+            };
+            audio_input_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                                           outputSettings:audioSettings];
+            audio_input_.expectsMediaDataInRealTime = YES;
+            if (![writer_ canAddInput:audio_input_]) return {"AAC writer cannot accept synthetic audio"};
+            [writer_ addInput:audio_input_];
+        }
         // No adaptor pool: SCK's IOSurface-backed pixel buffer goes to VideoToolbox unchanged.
         adaptor_ = [AVAssetWriterInputPixelBufferAdaptor
             assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input_ sourcePixelBufferAttributes:nil];
         if (![writer_ startWriting]) return {message(writer_.error, "video writer could not start")};
         [writer_ startSessionAtSourceTime:kCMTimeZero];
         return {};
+    }
+
+    bool write_test_tone(std::uint64_t sample_limit) {
+        if (!audio_input_) return true;
+        AudioStreamBasicDescription format{};
+        format.mSampleRate = 48000;
+        format.mFormatID = kAudioFormatLinearPCM;
+        format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        format.mBytesPerPacket = 4;
+        format.mFramesPerPacket = 1;
+        format.mBytesPerFrame = 4;
+        format.mChannelsPerFrame = 2;
+        format.mBitsPerChannel = 16;
+
+        CMAudioFormatDescriptionRef description = nullptr;
+        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &format, 0, nullptr, 0,
+                                            nullptr, nullptr, &description) != noErr)
+            return false;
+
+        bool ok = true;
+        while (audio_samples_ < sample_limit && !stop_requested_.load() && !finished_.load()) {
+            const auto count = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(1024, sample_limit - audio_samples_));
+            std::vector<std::int16_t> samples(count * 2);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const auto index = audio_samples_ + i;
+                // A short 440 Hz beep at the start of every second.
+                const double phase = 2.0 * 3.141592653589793 * 440.0 * (index % 48000) / 48000.0;
+                const auto value = static_cast<std::int16_t>((index % 48000 < 4800)
+                    ? std::sin(phase) * 8000.0 : 0.0);
+                samples[i * 2] = value;
+                samples[i * 2 + 1] = value;
+            }
+            CMBlockBufferRef block = nullptr;
+            const auto bytes = samples.size() * sizeof(std::int16_t);
+            if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes,
+                kCFAllocatorDefault, nullptr, 0, bytes, 0, &block) != kCMBlockBufferNoErr) {
+                ok = false; break;
+            }
+            if (CMBlockBufferReplaceDataBytes(samples.data(), block, 0, bytes) != kCMBlockBufferNoErr) {
+                CFRelease(block); ok = false; break;
+            }
+            CMSampleTimingInfo timing{CMTimeMake(1, 48000),
+                                      CMTimeMake(static_cast<std::int64_t>(audio_samples_), 48000),
+                                      kCMTimeInvalid};
+            CMSampleBufferRef sample = nullptr;
+            const auto status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, description,
+                                                          count, 1, &timing, 0, nullptr, &sample);
+            CFRelease(block);
+            if (status != noErr || !sample) { ok = false; break; }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+            while (!audio_input_.readyForMoreMediaData && !stop_requested_.load() &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (!audio_input_.readyForMoreMediaData || ![audio_input_ appendSampleBuffer:sample]) {
+                ok = false;
+            } else {
+                audio_samples_ += count;
+            }
+            CFRelease(sample);
+            if (!ok) break;
+        }
+        CFRelease(description);
+        return ok;
     }
 
     void run() {
@@ -343,8 +425,15 @@ private:
                     }
                     std::this_thread::sleep_for(milliseconds(2));
                 }
-                if (appended) written_.fetch_add(1);
-                else if (!stop_requested_.load()) dropped_.fetch_add(1);
+                if (appended) {
+                    written_.fetch_add(1);
+                    const auto target = ((slot + 1) * 48000ull) / options_.fps;
+                    if (options_.test_tone && !write_test_tone(target)) {
+                        std::lock_guard lock(mutex_);
+                        failure_ = message(writer_.error, "synthetic AAC append failed");
+                        finished_.store(true);
+                    }
+                } else if (!stop_requested_.load()) dropped_.fetch_add(1);
                 if (writer_.status == AVAssetWriterStatusFailed) {
                     std::lock_guard lock(mutex_);
                     failure_ = message(writer_.error, "video encoding failed");
@@ -374,6 +463,8 @@ private:
     dispatch_queue_t queue_ = nullptr;
     AVAssetWriter* __strong writer_ = nil;
     AVAssetWriterInput* __strong input_ = nil;
+    AVAssetWriterInput* __strong audio_input_ = nil;
+    std::uint64_t audio_samples_ = 0;
     AVAssetWriterInputPixelBufferAdaptor* __strong adaptor_ = nil;
     id __strong activity_ = nil;
     std::thread pacer_;
@@ -422,6 +513,29 @@ Result probe_file(const std::string& path, Probe& probe) {
             return {message(reader.error, "video decode failed")};
         if (!probe.frames) return {"no decoded frames"};
         probe.duration_seconds = CMTimeGetSeconds(track.timeRange.duration);
+        AVAssetTrack* audio = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+        if (audio) {
+            CMFormatDescriptionRef audioFormat =
+                (__bridge CMFormatDescriptionRef)audio.formatDescriptions.firstObject;
+            const auto subtype = audioFormat ? CMFormatDescriptionGetMediaSubType(audioFormat) : 0;
+            probe.audio_codec = subtype == kAudioFormatMPEG4AAC ? "aac" : "other";
+            probe.audio_duration_seconds = CMTimeGetSeconds(audio.timeRange.duration);
+            NSError* audioError = nil;
+            AVAssetReader* audioReader = [[AVAssetReader alloc] initWithAsset:asset error:&audioError];
+            if (!audioReader) return {message(audioError, "could not open audio track")};
+            AVAssetReaderTrackOutput* audioOutput = [[AVAssetReaderTrackOutput alloc]
+                initWithTrack:audio outputSettings:@{AVFormatIDKey: @(kAudioFormatLinearPCM)}];
+            if (![audioReader canAddOutput:audioOutput]) return {"could not decode audio"};
+            [audioReader addOutput:audioOutput];
+            if (![audioReader startReading]) return {message(audioReader.error, "audio decode start failed")};
+            while (CMSampleBufferRef buffer = [audioOutput copyNextSampleBuffer]) {
+                ++probe.audio_buffers;
+                CFRelease(buffer);
+            }
+            if (audioReader.status != AVAssetReaderStatusCompleted)
+                return {message(audioReader.error, "audio decode failed")};
+            if (!probe.audio_buffers) return {"audio track has no decoded samples"};
+        }
         return {};
     }
 }

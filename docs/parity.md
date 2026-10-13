@@ -11,7 +11,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Region capture | Missing | Retina coordinate mapping, crop boundaries, no stretching |
 | Native resolution and presets | Implemented, quality unverified | Native/1080p/1440p/4K on 16:9 and 16:10 displays |
 | 24/25/30/50/60/120 fps | Implemented, real-capture verification pending | Exact frame grid, refresh-rate/encoder limits handled |
-| H.264/HEVC MOV/MP4 | Implemented, synthetic E2E pending | Encode, finalize, full AVFoundation decode and frame-count verification |
+| H.264/HEVC MOV/MP4 | Implemented, synthetic E2E verified | Encode, finalize, full AVFoundation decode and frame-count verification |
 | ProRes 422 | Missing | MOV, quality and file-size inspection |
 | GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
 | System audio | Missing | Host-clock sync, output-device latency compensation, device changes |
@@ -21,7 +21,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
-| Test-pattern E2E | Implemented, CI acceptance pending | Encoded movies + complete decoder probe saved as CI artifacts |
+| Synthetic video + tone E2E | Implemented, CI acceptance pending | Encoded movies + complete decoder probe saved as CI artifacts |
 
 ## Replay and live output
 
