@@ -13,7 +13,7 @@ if(APPLE)
     target_link_libraries(rec PUBLIC
         "-framework Foundation" "-framework ScreenCaptureKit" "-framework AVFoundation"
         "-framework CoreMedia" "-framework CoreVideo" "-framework CoreGraphics"
-        "-framework CoreVideo" "-framework VideoToolbox")
+        "-framework VideoToolbox")
 else()
     target_sources(rec PRIVATE src/platform/unsupported.cpp)
 endif()
