@@ -19,10 +19,19 @@ Build a compact macOS recorder. Keep the recording engine usable from C++ withou
 
 ## Reference codebases
 
+Use these projects to understand patterns and tradeoffs, not as templates to copy.
+
 - `michaelshimeles/rec-rs`: ScreenCaptureKit frame handling, timing, AVAssetWriter output, A/V synchronization, replay and streaming requirements. Study its tests and `PERFORMANCE.md` before changing output semantics.
 - `obsproject/obs-studio`: separation of capture sources and outputs, texture lifetime, device changes, bounded queues, and encoder backpressure. Follow the architecture, not the plugin surface or GPL source code.
 - `jhomra21/daw-browser-convex`: native C++ ownership, realtime callback discipline, and isolation of runtime from UI.
 - `jhomra21/bgcut`: object-oriented public APIs, dependency direction, no speculative package splitting, and observable E2E acceptance.
+
+- `anomalyco/opencode` (OpenCode v2): package and domain ownership, Solid application structure, service boundaries, persistence, command/action design, and keeping UI state separate from lower-level runtime services.
+- `earendil-works/pi` (Pi): narrow interfaces, small composable building blocks, direct code, package boundaries, and avoiding unnecessary abstraction.
+- `diffusionstudio/editor` (Diffusion Studio), plus authorized `monorepo-new` when available: editor architecture, media/application boundaries, worker and background processing, and larger product organization.
+- `joshpuckett/dialkit` (DialKit): fine-grained interactive controls, parameter editing, reactive UI APIs, and small composable building blocks.
+- `solidjs-community/solid-primitives` (Solid Primitives): Solid API design, browser behavior, storage/persistence, lifecycle and cleanup, and package-local ownership.
+- `anomalyco/opentui` (OpenTUI): explicit command/result contracts, keyboard and interaction ownership, renderer/core separation, package APIs, and cleanup behavior in interactive systems.
 
 These are references, not dependencies. Record the upstream revision when copying a precise behavior or benchmark. Do not copy incompatible licensed source.
 
