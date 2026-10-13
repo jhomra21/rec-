@@ -21,6 +21,54 @@ if [[ "$(uname -s)" != Darwin ]]; then
   fi
   grep -q 'requires macOS' "$tmp/device.stderr"
 fi
+if [[ "$(uname -s)" == Darwin ]]; then
+  # Hardware encode and full AVFoundation decode, no TCC required.
+  "$rec" record --test-pattern -r 1080p -f 30 -t 2 --codec h264 -o "$tmp/synth.mov"
+  "$rec" probe "$tmp/synth.mov" > "$tmp/synth.probe"
+  grep -q '^codec=h264
+  [[ "$(uname -s)" == Darwin ]] || { echo 'screen capture E2E requires macOS' >&2; exit 1; }
+  "$rec" record --display 1 -r 1080p -f 30 -t 3 --codec h264 -o "$tmp/demo.mov"
+  [[ -s "$tmp/demo.mov" ]] || { echo 'missing recording output' >&2; exit 1; }
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,nb_frames \
+      -of default=noprint_wrappers=1 "$tmp/demo.mov" | tee "$tmp/probe.txt"
+    grep -q '^codec_name=h264$' "$tmp/probe.txt"
+    grep -q '^nb_frames=90$' "$tmp/probe.txt"
+  fi
+fi
+echo 'smoke passed'
+ "$tmp/synth.probe"
+  grep -q '^frames=60
+  [[ "$(uname -s)" == Darwin ]] || { echo 'screen capture E2E requires macOS' >&2; exit 1; }
+  "$rec" record --display 1 -r 1080p -f 30 -t 3 --codec h264 -o "$tmp/demo.mov"
+  [[ -s "$tmp/demo.mov" ]] || { echo 'missing recording output' >&2; exit 1; }
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,nb_frames \
+      -of default=noprint_wrappers=1 "$tmp/demo.mov" | tee "$tmp/probe.txt"
+    grep -q '^codec_name=h264$' "$tmp/probe.txt"
+    grep -q '^nb_frames=90$' "$tmp/probe.txt"
+  fi
+fi
+echo 'smoke passed'
+ "$tmp/synth.probe"
+  grep -q '^width=1920
+  [[ "$(uname -s)" == Darwin ]] || { echo 'screen capture E2E requires macOS' >&2; exit 1; }
+  "$rec" record --display 1 -r 1080p -f 30 -t 3 --codec h264 -o "$tmp/demo.mov"
+  [[ -s "$tmp/demo.mov" ]] || { echo 'missing recording output' >&2; exit 1; }
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,nb_frames \
+      -of default=noprint_wrappers=1 "$tmp/demo.mov" | tee "$tmp/probe.txt"
+    grep -q '^codec_name=h264$' "$tmp/probe.txt"
+    grep -q '^nb_frames=90$' "$tmp/probe.txt"
+  fi
+fi
+echo 'smoke passed'
+ "$tmp/synth.probe"
+  if "$rec" record --test-pattern -t 1 -o "$tmp/synth.mov" > "$tmp/overwrite.stdout" 2> "$tmp/overwrite.stderr"; then
+    echo 'existing output overwritten' >&2; exit 1
+  fi
+  grep -q 'already exists' "$tmp/overwrite.stderr"
+fi
 if [[ "${REC_E2E_CAPTURE:-0}" == 1 ]]; then
   [[ "$(uname -s)" == Darwin ]] || { echo 'screen capture E2E requires macOS' >&2; exit 1; }
   "$rec" record --display 1 -r 1080p -f 30 -t 3 --codec h264 -o "$tmp/demo.mov"

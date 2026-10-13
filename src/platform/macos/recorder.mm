@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -112,18 +113,20 @@ public:
     Result start() {
         @autoreleasepool {
             if (active_) return {"already recording"};
+            if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
             std::string error;
+            if (options_.output.empty()) return {"output path is empty"};
+            NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
+            if (!path) return {"invalid output path"};
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path])
+                return {"output file already exists: " + options_.output};
+            if (!options_.test_pattern) {
             SCShareableContent* content = shareable(error);
             if (!content) return {error};
             if (options_.display > content.displays.count) return {"display index not found; run `rec devices`"};
             SCDisplay* display = content.displays[options_.display - 1];
             size_ = output_size(options_, display);
             if (!size_.width || !size_.height) return {"display has no usable pixel dimensions"};
-            if (options_.output.empty()) return {"output path is empty"};
-            NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:path])
-                return {"output file already exists: " + options_.output};
-
             SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
             SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
             config.width = size_.width;
@@ -160,6 +163,40 @@ public:
                 }
             }
             if (!error.empty()) { stop(); return {error}; }
+            } else {
+                // Exercise the real VideoToolbox writer without TCC, display or compositor.
+                size_ = {options_.width ? options_.width : 1920u,
+                         options_.height ? options_.height : 1080u};
+                size_.width &= ~1u;
+                size_.height &= ~1u;
+                if (size_.width < 2 || size_.height < 2) return {"invalid synthetic frame dimensions"};
+                CVPixelBufferRef pixel = nullptr;
+                NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+                const CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault,
+                    size_.width, size_.height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    (__bridge CFDictionaryRef)attributes, &pixel);
+                if (result != kCVReturnSuccess || !pixel) return {"synthetic frame allocation failed"};
+                CVPixelBufferLockBaseAddress(pixel, 0);
+                for (size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 0); ++row) {
+                    auto* y = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 0));
+                    const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
+                    std::memset(y + row * stride, row % 24 < 12 ? 175 : 65,
+                                CVPixelBufferGetWidthOfPlane(pixel, 0));
+                }
+                for (size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 1); ++row) {
+                    auto* uv = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 1));
+                    const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
+                    std::memset(uv + row * stride, 128,
+                                CVPixelBufferGetWidthOfPlane(pixel, 1) * 2);
+                }
+                CVPixelBufferUnlockBaseAddress(pixel, 0);
+                {
+                    std::lock_guard lock(mutex_);
+                    newest_ = pixel;
+                    captured_.store(1);
+                }
+                active_.store(true);
+            }
             auto ready = create_writer();
             if (!ready) { stop(); return ready; }
             activity_ = [[NSProcessInfo processInfo]
@@ -292,16 +329,26 @@ private:
                     frame = newest_;
                     if (frame) CVPixelBufferRetain(frame);
                 }
-                if (!frame || !input_.readyForMoreMediaData ||
-                    ![adaptor_ appendPixelBuffer:frame withPresentationTime:CMTimeMake(static_cast<int64_t>(slot), static_cast<int32_t>(options_.fps))]) {
-                    dropped_.fetch_add(1);
-                    if (writer_.status == AVAssetWriterStatusFailed) {
-                        std::lock_guard lock(mutex_);
-                        failure_ = message(writer_.error, "video encoding failed");
-                        finished_.store(true);
+                // Retry the same timestamp for up to 500 ms on transient backpressure.
+                // Never hold a stream callback or create an unbounded frame queue.
+                bool appended = false;
+                const auto deadline = tick + milliseconds(500);
+                while (frame && !stop_requested_.load() && !finished_.load() &&
+                       steady_clock::now() < deadline && writer_.status != AVAssetWriterStatusFailed) {
+                    if (input_.readyForMoreMediaData &&
+                        [adaptor_ appendPixelBuffer:frame withPresentationTime:
+                            CMTimeMake(static_cast<int64_t>(slot), static_cast<int32_t>(options_.fps))]) {
+                        appended = true;
+                        break;
                     }
-                } else {
-                    written_.fetch_add(1);
+                    std::this_thread::sleep_for(milliseconds(2));
+                }
+                if (appended) written_.fetch_add(1);
+                else if (!stop_requested_.load()) dropped_.fetch_add(1);
+                if (writer_.status == AVAssetWriterStatusFailed) {
+                    std::lock_guard lock(mutex_);
+                    failure_ = message(writer_.error, "video encoding failed");
+                    finished_.store(true);
                 }
                 if (frame) CVPixelBufferRelease(frame);
             }
@@ -335,6 +382,49 @@ private:
     std::atomic_bool finished_{false};
     std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0};
 };
+
+Result probe_file(const std::string& path, Probe& probe) {
+    @autoreleasepool {
+        probe = {};
+        NSString* name = [NSString stringWithUTF8String:path.c_str()];
+        if (!name) return {"invalid recording path"};
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:name] options:nil];
+        AVAssetTrack* track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!track) return {"no video track"};
+        const CGSize size = track.naturalSize;
+        probe.width = static_cast<std::uint32_t>(std::abs(size.width));
+        probe.height = static_cast<std::uint32_t>(std::abs(size.height));
+        CMFormatDescriptionRef format = (__bridge CMFormatDescriptionRef)track.formatDescriptions.firstObject;
+        const auto codec = format ? CMFormatDescriptionGetMediaSubType(format) : 0;
+        probe.codec = codec == kCMVideoCodecType_H264 ? "h264" :
+                      codec == kCMVideoCodecType_HEVC ? "hevc" : "other";
+        NSError* error = nil;
+        AVAssetReader* reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+        if (!reader) return {message(error, "could not open movie")};
+        AVAssetReaderTrackOutput* output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track
+            outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
+        if (![reader canAddOutput:output]) return {"could not decode video"};
+        [reader addOutput:output];
+        if (![reader startReading]) return {message(reader.error, "video decode start failed")};
+        CMTime previous = kCMTimeInvalid;
+        while (CMSampleBufferRef sample = [output copyNextSampleBuffer]) {
+            const CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sample);
+            if (CMTIME_IS_VALID(previous) && CMTimeCompare(timestamp, previous) <= 0) {
+                CFRelease(sample);
+                [reader cancelReading];
+                return {"video timestamps are not strictly increasing"};
+            }
+            previous = timestamp;
+            ++probe.frames;
+            CFRelease(sample);
+        }
+        if (reader.status != AVAssetReaderStatusCompleted)
+            return {message(reader.error, "video decode failed")};
+        if (!probe.frames) return {"no decoded frames"};
+        probe.duration_seconds = CMTimeGetSeconds(track.timeRange.duration);
+        return {};
+    }
+}
 
 void receive_frame(void* owner, CMSampleBufferRef sample) {
     static_cast<CaptureState*>(owner)->on_frame(sample);

@@ -19,7 +19,8 @@ void usage() {
     std::cout << "rec: native macOS screen recorder\n\n"
                  "Usage:\n"
                  "  rec devices\n"
-                 "  rec record [options]\n\n"
+                 "  rec record [options]\n"
+                 "  rec probe FILE\n\n"
                  "Options:\n"
                  "  -o, --output FILE       Output .mp4 or .mov (default: rec.mov)\n"
                  "  --display N             Display number from devices (default: 1)\n"
@@ -28,7 +29,8 @@ void usage() {
                  "  -t, --duration SECONDS   Recording length (0 = until Ctrl-C)\n"
                  "  --codec NAME             auto, h264, hevc\n"
                  "  --bitrate MBPS           Target megabits/second (0 = automatic)\n"
-                 "  --no-cursor              Do not record the cursor\n";
+                 "  --no-cursor              Do not record the cursor\n"
+                 "  --test-pattern           Synthetic encode (no screen permission)\n";
 }
 
 bool integer(std::string_view s, std::uint32_t& out) {
@@ -48,6 +50,7 @@ bool parse(int argc, char** argv, rec::Options& o, std::string& error) {
     for (int i = 2; i < argc; ++i) {
         std::string_view arg(argv[i]);
         if (arg == "--no-cursor") { o.cursor = false; continue; }
+        if (arg == "--test-pattern") { o.test_pattern = true; continue; }
         if (i + 1 >= argc) { error = "missing value for " + std::string(arg); return false; }
         std::string_view value(argv[++i]);
         if (arg == "-o" || arg == "--output") o.output = value;
@@ -98,6 +101,17 @@ int main(int argc, char** argv) {
             std::cout << i + 1 << ": " << screen.name << " (" << screen.width << "x" << screen.height
                       << ", id " << screen.id << ")\n";
         }
+        return 0;
+    }
+    if (command == "probe") {
+        if (argc != 3) { std::cerr << "usage: rec probe FILE\n"; return 2; }
+        rec::Probe probe;
+        if (auto result = rec::probe_file(argv[2], probe); !result) {
+            std::cerr << result.error << '\n'; return 1;
+        }
+        std::cout << "codec=" << probe.codec << "\nwidth=" << probe.width
+                  << "\nheight=" << probe.height << "\nframes=" << probe.frames
+                  << "\nduration=" << probe.duration_seconds << '\n';
         return 0;
     }
     if (command != "record") { std::cerr << "unknown command: " << command << '\n'; return 2; }

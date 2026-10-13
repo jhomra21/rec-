@@ -18,6 +18,7 @@ struct Options {
     std::uint32_t bitrate_mbps = 0; // 0 = selected from resolution
     Codec codec = Codec::automatic;
     bool cursor = true;
+    bool test_pattern = false; // Synthetic frame, for hardware-encoder E2E without screen permission.
     double duration_seconds = 10.0; // 0 = until stop()
 };
 
@@ -34,6 +35,14 @@ struct Stats {
     std::uint64_t dropped = 0;
 };
 
+struct Probe {
+    std::uint64_t frames = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    double duration_seconds = 0;
+    std::string codec;
+};
+
 struct Result {
     std::string error;
     explicit operator bool() const noexcept { return error.empty(); }
@@ -41,6 +50,7 @@ struct Result {
 
 // A failure sets error and returns an empty list.
 std::vector<Display> list_displays(std::string& error);
+Result probe_file(const std::string& path, Probe& probe);
 
 class Recorder {
 public:

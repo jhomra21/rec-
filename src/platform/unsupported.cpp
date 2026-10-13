@@ -5,6 +5,7 @@ std::vector<Display> list_displays(std::string& error) {
     error = "screen capture requires macOS 15 or newer";
     return {};
 }
+Result probe_file(const std::string&, Probe&) { return {"probing recordings requires macOS"}; }
 class Recorder::Impl {};
 Recorder::Recorder(Options) : impl_(std::make_unique<Impl>()) {}
 Recorder::~Recorder() = default;

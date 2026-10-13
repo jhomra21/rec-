@@ -29,6 +29,12 @@ You can stop an unlimited recording with Ctrl-C:
 
 ## Verify
 
+The `--test-pattern` capture path bypasses desktop permission and encodes a real synthetic NV12 video using VideoToolbox. On macOS, the smoke command also runs `rec probe` to decode every frame using AVFoundation, verify the codec and frame count, and check monotonic timestamps. Screen recording permission is still needed to validate a real display.
+
+`rec probe file.mov` reports decoded frames, dimensions, codec, and duration.
+
+
+
 ```sh
 ./scripts/smoke.sh
 REC_E2E_CAPTURE=1 ./scripts/smoke.sh
