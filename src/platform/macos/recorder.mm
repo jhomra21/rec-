@@ -9,6 +9,7 @@
 #include "rec/rec.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,7 @@
 
 namespace rec {
 void receive_frame(void* owner, CMSampleBufferRef sample);
+void receive_audio(void* owner, CMSampleBufferRef sample);
 void receive_failure(void* owner, NSError* error);
 }
 
@@ -31,7 +33,9 @@ void receive_failure(void* owner, NSError* error);
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)buffer
        ofType:(SCStreamOutputType)type {
     (void)stream;
-    if (self.owner && type == SCStreamOutputTypeScreen) rec::receive_frame(self.owner, buffer);
+    if (!self.owner) return;
+    if (type == SCStreamOutputTypeScreen) rec::receive_frame(self.owner, buffer);
+    else if (type == SCStreamOutputTypeAudio) rec::receive_audio(self.owner, buffer);
 }
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
     (void)stream;
@@ -117,6 +121,7 @@ public:
             if (active_) return {"already recording"};
             if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
             if (options_.test_tone && !options_.test_pattern) return {"test tone needs test pattern"};
+            if (options_.system_audio && options_.test_pattern) return {"system audio requires a screen"};
             std::string error;
             if (options_.output.empty()) return {"output path is empty"};
             NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
@@ -138,17 +143,29 @@ public:
             config.minimumFrameInterval = CMTimeMake(9, static_cast<int32_t>(options_.fps * 10));
             config.queueDepth = 3;
             config.showsCursor = options_.cursor;
-            config.capturesAudio = NO;
+            config.capturesAudio = options_.system_audio;
+            config.sampleRate = 48000;
+            config.channelCount = 2;
+            config.excludesCurrentProcessAudio = YES;
             config.scalesToFit = YES;
             config.preservesAspectRatio = YES;
             receiver_ = [[RecCaptureOutput alloc] init];
             receiver_.owner = this;
             queue_ = dispatch_queue_create("rec.capture.frames", DISPATCH_QUEUE_SERIAL);
+            if (options_.system_audio)
+                audio_dispatch_queue_ = dispatch_queue_create("rec.capture.audio", DISPATCH_QUEUE_SERIAL);
             stream_ = [[SCStream alloc] initWithFilter:filter configuration:config delegate:receiver_];
             NSError* streamError = nil;
             if (![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeScreen
                       sampleHandlerQueue:queue_ error:&streamError]) {
                 error = message(streamError, "could not subscribe to screen frames");
+                cleanup_capture();
+                return {error};
+            }
+            if (options_.system_audio &&
+                ![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeAudio
+                      sampleHandlerQueue:audio_dispatch_queue_ error:&streamError]) {
+                error = message(streamError, "could not subscribe to system audio");
                 cleanup_capture();
                 return {error};
             }
@@ -207,6 +224,7 @@ public:
                 reason:@"Screen recording"];
             finished_.store(false);
             stop_requested_.store(false);
+            host_origin_ = CMClockGetTime(CMClockGetHostTimeClock());
             pacer_ = std::thread([this] { run(); });
             return {};
         }
@@ -220,6 +238,7 @@ public:
                 if (active_) result = wait_capture(stream_, false);
                 // Drain callbacks before clearing their unowned C++ pointer.
                 if (queue_) dispatch_sync(queue_, ^{});
+                if (audio_dispatch_queue_) dispatch_sync(audio_dispatch_queue_, ^{});
                 cleanup_capture();
             }
             if (writer_) {
@@ -239,6 +258,15 @@ public:
                 writer_ = nil;
             }
             if (activity_) { [[NSProcessInfo processInfo] endActivity:activity_]; activity_ = nil; }
+            {
+                std::lock_guard lock(mutex_);
+                while (audio_count_) {
+                    CFRelease(audio_packets_[audio_head_]);
+                    audio_packets_[audio_head_] = nullptr;
+                    audio_head_ = (audio_head_ + 1) % audio_packets_.size();
+                    --audio_count_;
+                }
+            }
             {
                 std::lock_guard lock(mutex_);
                 if (newest_) { CVPixelBufferRelease(newest_); newest_ = nullptr; }
@@ -269,6 +297,21 @@ public:
         frames_ready_.notify_one();
     }
 
+    void on_audio(CMSampleBufferRef sample) {
+        if (!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) return;
+        CFRetain(sample);
+        std::lock_guard lock(mutex_);
+        if (audio_count_ == audio_packets_.size()) {
+            CFRelease(audio_packets_[audio_head_]);
+            audio_packets_[audio_head_] = nullptr;
+            audio_head_ = (audio_head_ + 1) % audio_packets_.size();
+            --audio_count_;
+            audio_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        audio_packets_[(audio_head_ + audio_count_) % audio_packets_.size()] = sample;
+        ++audio_count_;
+    }
+
     void on_failure(NSError* error) {
         {
             std::lock_guard lock(mutex_);
@@ -280,7 +323,10 @@ public:
 
     bool running() const noexcept { return active_ && !finished_.load(); }
     bool finished() const noexcept { return finished_.load(); }
-    Stats stats() const noexcept { return {captured_.load(), written_.load(), dropped_.load()}; }
+    Stats stats() const noexcept {
+        return {captured_.load(), written_.load(), dropped_.load(),
+                audio_written_.load(), audio_dropped_.load()};
+    }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
 
 private:
@@ -310,7 +356,7 @@ private:
         input_.expectsMediaDataInRealTime = YES;
         if (![writer_ canAddInput:input_]) return {"video encoder cannot accept the selected settings"};
         [writer_ addInput:input_];
-        if (options_.test_tone) {
+        if (options_.test_tone || options_.system_audio) {
             NSDictionary* audioSettings = @{
                 AVFormatIDKey: @(kAudioFormatMPEG4AAC),
                 AVSampleRateKey: @48000,
@@ -329,6 +375,74 @@ private:
         if (![writer_ startWriting]) return {message(writer_.error, "video writer could not start")};
         [writer_ startSessionAtSourceTime:kCMTimeZero];
         return {};
+    }
+
+    void write_system_audio() {
+        if (!audio_input_ || !options_.system_audio) return;
+        // Drain on the recording thread. Never encode or block in the SCK callback.
+        for (std::size_t packet = 0; packet < audio_packets_.size(); ++packet) {
+            CMSampleBufferRef sample = nullptr;
+            {
+                std::lock_guard lock(mutex_);
+                if (!audio_count_) break;
+                sample = audio_packets_[audio_head_];
+                audio_packets_[audio_head_] = nullptr;
+                audio_head_ = (audio_head_ + 1) % audio_packets_.size();
+                --audio_count_;
+            }
+            if (!sample) continue;
+            const auto timestamp = CMSampleBufferGetPresentationTimeStamp(sample);
+            if (!CMTIME_IS_VALID(timestamp) || CMTimeCompare(timestamp, host_origin_) < 0) {
+                audio_dropped_.fetch_add(1);
+                CFRelease(sample);
+                continue;
+            }
+
+            CMItemCount entries = 0;
+            auto status = CMSampleBufferGetSampleTimingInfoArray(sample, 0, nullptr, &entries);
+            std::array<CMSampleTimingInfo, 8> timing{};
+            if (status != noErr || entries < 1 ||
+                entries > static_cast<CMItemCount>(timing.size())) {
+                audio_dropped_.fetch_add(1);
+                CFRelease(sample);
+                continue;
+            }
+            status = CMSampleBufferGetSampleTimingInfoArray(sample, entries, timing.data(), &entries);
+            if (status != noErr) {
+                audio_dropped_.fetch_add(1);
+                CFRelease(sample);
+                continue;
+            }
+            for (CMItemCount i = 0; i < entries; ++i) {
+                if (CMTIME_IS_VALID(timing[i].presentationTimeStamp))
+                    timing[i].presentationTimeStamp =
+                        CMTimeSubtract(timing[i].presentationTimeStamp, host_origin_);
+                if (CMTIME_IS_VALID(timing[i].decodeTimeStamp))
+                    timing[i].decodeTimeStamp =
+                        CMTimeSubtract(timing[i].decodeTimeStamp, host_origin_);
+            }
+
+            CMSampleBufferRef adjusted = nullptr;
+            status = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, sample,
+                                                            entries, timing.data(), &adjusted);
+            CFRelease(sample);
+            if (status != noErr || !adjusted) {
+                audio_dropped_.fetch_add(1);
+                continue;
+            }
+            if (audio_input_.readyForMoreMediaData &&
+                [audio_input_ appendSampleBuffer:adjusted]) {
+                audio_written_.fetch_add(1);
+            } else {
+                audio_dropped_.fetch_add(1);
+                if (writer_.status == AVAssetWriterStatusFailed) {
+                    std::lock_guard lock(mutex_);
+                    failure_ = message(writer_.error, "system audio encoding failed");
+                    finished_.store(true);
+                }
+            }
+            CFRelease(adjusted);
+        }
     }
 
     bool write_test_tone(std::uint64_t sample_limit) {
@@ -440,8 +554,10 @@ private:
                     finished_.store(true);
                 }
                 if (frame) CVPixelBufferRelease(frame);
+                write_system_audio();
             }
         }
+        if (!stop_requested_.load()) write_system_audio();
         finished_.store(true);
     }
 
@@ -450,6 +566,7 @@ private:
         receiver_ = nil;
         stream_ = nil;
         queue_ = nil;
+        audio_dispatch_queue_ = nil;
     }
 
     Options options_;
@@ -461,6 +578,11 @@ private:
     SCStream* __strong stream_ = nil;
     RecCaptureOutput* __strong receiver_ = nil;
     dispatch_queue_t queue_ = nullptr;
+    dispatch_queue_t audio_dispatch_queue_ = nullptr;
+    std::array<CMSampleBufferRef, 16> audio_packets_{};
+    std::size_t audio_head_ = 0;
+    std::size_t audio_count_ = 0;
+    CMTime host_origin_ = kCMTimeInvalid;
     AVAssetWriter* __strong writer_ = nil;
     AVAssetWriterInput* __strong input_ = nil;
     AVAssetWriterInput* __strong audio_input_ = nil;
@@ -472,6 +594,7 @@ private:
     std::atomic_bool active_{false};
     std::atomic_bool finished_{false};
     std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0};
+    std::atomic<std::uint64_t> audio_written_{0}, audio_dropped_{0};
 };
 
 Result probe_file(const std::string& path, Probe& probe) {
@@ -542,6 +665,9 @@ Result probe_file(const std::string& path, Probe& probe) {
 
 void receive_frame(void* owner, CMSampleBufferRef sample) {
     static_cast<CaptureState*>(owner)->on_frame(sample);
+}
+void receive_audio(void* owner, CMSampleBufferRef sample) {
+    static_cast<CaptureState*>(owner)->on_audio(sample);
 }
 void receive_failure(void* owner, NSError* error) {
     static_cast<CaptureState*>(owner)->on_failure(error);
