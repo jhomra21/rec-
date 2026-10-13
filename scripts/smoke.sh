@@ -20,6 +20,14 @@ if "$rec" record --resolution gigantic >"$tmp/invalid.stdout" 2>"$tmp/invalid.st
   echo 'invalid resolution was accepted' >&2; exit 1
 fi
 grep -q 'resolution must be' "$tmp/invalid.stderr"
+if "$rec" record --test-tone >"$tmp/invalid.stdout" 2>"$tmp/invalid.stderr"; then
+  echo 'test tone accepted without test pattern' >&2; exit 1
+fi
+grep -q 'requires --test-pattern' "$tmp/invalid.stderr"
+if "$rec" record --test-pattern --system-audio >"$tmp/invalid.stdout" 2>"$tmp/invalid.stderr"; then
+  echo 'system audio accepted with synthetic capture' >&2; exit 1
+fi
+grep -q 'needs a real screen' "$tmp/invalid.stderr"
 
 if [[ "$(uname -s)" != Darwin ]]; then
   if "$rec" devices >"$tmp/device.stdout" 2>"$tmp/device.stderr"; then
