@@ -2,7 +2,7 @@
 
 ## Scope
 
-Build a compact macOS recorder. Keep the recording engine usable from C++ without the CLI or a GUI. The first implementation captures one display and writes H.264 or HEVC video using ScreenCaptureKit and AVAssetWriter. Audio, window capture, camera compositing, replay, and streaming are future work, not implied by the current API.
+Build a compact macOS recorder. Keep the recording engine usable from C++ without the CLI or a GUI. The current initial implementation captures one display and writes H.264 or HEVC video using ScreenCaptureKit and AVAssetWriter. The product goal is full feature parity with rec-rs, including audio, camera, scenes, replay, streaming, and a native UI. Track implemented, verified, and missing behavior separately in `docs/parity.md`. Do not imply parity from a compiled interface.
 
 ## Decisions
 
@@ -13,9 +13,10 @@ Build a compact macOS recorder. Keep the recording engine usable from C++ withou
 - Expose errors at the API boundary. No exceptions across the Apple callback boundary.
 - Prefer Apple frameworks and the C++ standard library. Do not add FFmpeg, Qt, Electron, or a plugin framework by default.
 - Verify end-to-end output files on macOS before claiming recording quality or performance. Linux builds exercise the CLI and unsupported-platform contract only.
-- Do not write unit tests. Use end-to-end capture and output verification for behavior.
+- Do not write unit tests. Use end-to-end capture and output verification for behavior; retain output recordings and probe results as reproducible CI artifacts.
 - Keep benchmarks reproducible: same machine, same screen content, codec, output frame rate, resolution, and recording duration. Include encoder backpressure and memory samples.
 - Add an abstraction only when a concrete second implementation needs it.
+- The native interface should feel joyful, clear and responsive: one-step recording, obvious status, accessible controls, and no hidden-preview background rendering. Keep the recording core independent from UI lifecycles.
 
 ## Reference codebases
 
