@@ -14,14 +14,14 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | H.264/HEVC MOV/MP4 | Implemented, synthetic E2E verified | Encode, finalize, full AVFoundation decode and frame-count verification |
 | ProRes 422 | Missing | MOV, quality and file-size inspection |
 | GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
-| System audio | Missing | Host-clock sync, output-device latency compensation, device changes |
+| System audio | Experimental SCK capture, unverified on a permissioned Mac | Verify audio present, drift, output-device latency compensation, overload, sleep and device changes |
 | Microphone | Missing | Mono/stereo input, sample-rate conversion, disconnect/reconnect |
 | Mixed audio and separate stems | Missing | Gain, clipping, offsets, gap handling, separate importable tracks |
 | Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
 | Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
-| Synthetic video + tone E2E | Implemented, CI acceptance pending | Encoded movies + complete decoder probe saved as CI artifacts |
+| Synthetic video + tone E2E | Passed on macOS CI | Encoded movies + complete decoder probe saved as CI artifacts |
 
 ## Replay and live output
 
