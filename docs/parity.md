@@ -15,9 +15,9 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | ProRes 422 | Missing | MOV, quality and file-size inspection |
 | GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
 | System audio | Live flash/beep verified. macOS (SCK, 28 ms output-latency offset): two runs, means +24.3 and +25.6 ms, worst 38.9 ms. Windows (WASAPI loopback): mean −12.8 ms, worst 13.3 ms | `scripts/e2e-live-audio.sh` / `.ps1`: flash/beep offset within ITU window; drift, overload, sleep and device changes |
-| Microphone | Live 3-track runs pass on both. macOS: 4 runs, means +21.5 to +31.3 ms, 6/6 pairs on run 2; occasional start-up drop counts were pre-origin pre-roll, fixed by draining before counting (Mac rerun pending). Windows: USB interface, mean −11.9 ms, 0 drops | `REC_E2E_MIC=1` live script; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
+| Microphone | Live 3-track runs pass on both. macOS: 14 runs, means +20.8 to +36.2 ms; since `8cfe365`, 10/10 runs with 6/6 pairs and 0 dropped buffers (start-up pre-roll is drained before drops count). Windows: USB interface, mean −11.9 ms, 0 drops | `REC_E2E_MIC=1` live script; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
 | Mixed audio and separate stems | Synthetic and live mix + stems verified on macOS and Windows | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
-| Single-clock A/V sync | Timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; live 12 s runs within 39.2 ms (macOS) and 17.2 ms (Windows) | 30-minute drift |
+| Single-clock A/V sync | Timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; live 12 s runs within 43.7 ms (macOS) and 17.2 ms (Windows) | 30-minute drift |
 | Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
 | Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
