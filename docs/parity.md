@@ -6,7 +6,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 
 | Capability | State | Required acceptance |
 | --- | --- | --- |
-| Display capture | macOS: implemented, real-capture verification pending. Windows: verified (WGC, 4K display at 30/60 fps, 0 drops) | 30/60 fps on physical display, correct dimensions and output frames |
+| Display capture | Verified on macOS (M3 Pro, 30/60 fps, 0 drops; presets keep the display's aspect, so 1080p gives 1670x1080 there) and Windows (WGC, 4K display at 30/60 fps, 0 drops) | 30/60 fps on physical display, correct dimensions and output frames |
 | Window capture | Missing | Resize, occlusion, title/ID selection, minimize/reopen |
 | Region capture | Missing | Retina coordinate mapping, crop boundaries, no stretching |
 | Native resolution and presets | Implemented, quality unverified | Native/1080p/1440p/4K on 16:9 and 16:10 displays |
@@ -14,15 +14,15 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | H.264/HEVC MOV/MP4 | Synthetic E2E verified on macOS; synthetic and live verified on Windows (Media Foundation, ISO MP4 structure for .mov) | Encode, finalize, full decode and frame-count verification |
 | ProRes 422 | Missing | MOV, quality and file-size inspection |
 | GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
-| System audio | macOS: SCK capture with output-latency offset, live sync unverified on a permissioned Mac. Windows: WASAPI loopback, live flash/beep mean −12.8 ms, worst 13.3 ms | `scripts/e2e-live-audio.sh` / `.ps1`: flash/beep offset within ITU window; drift, overload, sleep and device changes |
-| Microphone | macOS: SCK capture (macOS 15), device selection, unverified on a permissioned Mac. Windows: WASAPI capture, live 3-track run verified (USB interface, 0 drops) | `REC_E2E_MIC=1` live script; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
-| Mixed audio and separate stems | Synthetic mix + stems verified on macOS and Windows; live mix verified on Windows | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
-| Single-clock A/V sync | Implemented on both: timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; Windows live 12 s within 17.2 ms | Live flash/beep offset on macOS, 30-minute drift |
+| System audio | Live flash/beep verified. macOS (SCK, 28 ms output-latency offset): mean +25.6 ms, worst 31.8 ms. Windows (WASAPI loopback): mean −12.8 ms, worst 13.3 ms | `scripts/e2e-live-audio.sh` / `.ps1`: flash/beep offset within ITU window; drift, overload, sleep and device changes |
+| Microphone | Live 3-track runs pass on both. macOS: mean +21.5 ms, but 2 system and 3 mic buffers dropped (undiagnosed). Windows: USB interface, mean −11.9 ms, 0 drops | `REC_E2E_MIC=1` live script; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
+| Mixed audio and separate stems | Synthetic and live mix + stems verified on macOS and Windows | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
+| Single-clock A/V sync | Timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; live 12 s runs within 32 ms (macOS) and 17.2 ms (Windows) | 30-minute drift |
 | Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
 | Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
-| Synthetic video + tone E2E | Passed on macOS CI; passed locally on Windows | Encoded movies + complete decoder probe saved as CI artifacts |
+| Synthetic video + tone E2E | Passed on macOS CI and on a Mac; passed locally on Windows | Encoded movies + complete decoder probe saved as CI artifacts |
 | Synthetic flash/beep sync, mixer and track layouts | Passed on macOS CI; passed locally on Windows | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
 
 ## Replay and live output

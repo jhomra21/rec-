@@ -2,7 +2,7 @@
 
 A compact screen recorder for macOS and Windows, built with C++20 and each platform's native capture and hardware encoding frameworks.
 
-Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone is verified on Windows; on macOS it still awaits a run on a Mac with the required permissions. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
+Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone passes the flash/beep sync test on a Mac (M3 Pro) and on a Windows PC; see [the Mac evidence](docs/evidence/2026-10-16-live-test/README.md) and the Windows measurements below. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
 
 ## Build
 
@@ -111,7 +111,8 @@ Most of the working set and private memory belongs to the GPU driver's Direct3D 
 
 ## Current limits
 
-- Capture is display-only. On macOS, live system audio and microphone capture have not yet been verified on a permissioned Mac.
+- Capture is display-only.
+- On the Mac live run with the microphone, the 16-buffer audio queues dropped 2 system and 3 microphone buffers. This is not yet diagnosed.
 - Windows loopback captures the default output device. rec plays silence on it while recording so the audio clock keeps moving when nothing else plays.
 - The output latency is read once, when recording starts. Switching output devices mid-recording keeps the old offset.
 - A microphone that is not 48 kHz is resampled linearly per buffer for the mix. Its stem is converted by AVFoundation.
