@@ -23,7 +23,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
 | Synthetic video + tone E2E | Passed on macOS CI | Encoded movies + complete decoder probe saved as CI artifacts |
-| Synthetic flash/beep sync, mixer and track layouts | Added; awaiting macOS CI | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
+| Synthetic flash/beep sync, mixer and track layouts | Passed on macOS CI | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
 
 ## Replay and live output
 
