@@ -8,7 +8,7 @@ target_include_directories(rec PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if(APPLE)
     enable_language(OBJCXX)
-    target_sources(rec PRIVATE src/platform/macos/recorder.mm src/core/rtmp.cpp)
+    target_sources(rec PRIVATE src/platform/macos/recorder.mm src/platform/macos/stream.cpp src/core/rtmp.cpp)
     set_source_files_properties(src/platform/macos/recorder.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(rec PRIVATE GL_SILENCE_DEPRECATION)
     target_link_libraries(rec PUBLIC

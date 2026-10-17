@@ -2,8 +2,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/scripts/mediamtx.sh"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'stop_mediamtx; rm -rf "$tmp"' EXIT
 artifacts="${REC_E2E_ARTIFACT_DIR:-$tmp}"
 mkdir -p "$artifacts"
 
@@ -42,8 +43,6 @@ expect_failure 'stream bitrate must be' record --stream-bitrate 100
 if [[ "$(uname -s)" != Darwin ]]; then
   expect_failure 'requires macOS' devices
 else
-  expect_failure 'streaming is not available on macOS yet' record --test-pattern -t 1 \
-    --stream rtmp://127.0.0.1/live/key -o "$tmp/stream.mov"
   # The live A/V sync stimulus must at least compile.
   swiftc -typecheck "$root/scripts/flash-beep.swift"
 
@@ -118,6 +117,60 @@ else
   within "$(value frames "$artifacts/crash.probe")" 60 120
   within "$(value av_sync_events "$artifacts/crash.probe")" 2 4
   within "$(value av_offset_max_ms "$artifacts/crash.probe")" 0 20
+  # Live streaming: a local MediaMTX server receives the RTMP stream and records it. The
+  # received file must decode with the frames and A/V sync of the local recording.
+  expect_failure 'must start with rtmp://' record --test-pattern -t 1 --stream http://127.0.0.1/live/key -o "$tmp/bad-url.mov"
+  expect_failure 'must look like rtmp://' record --test-pattern -t 1 --stream rtmp://127.0.0.1/key -o "$tmp/bad-path.mov"
+  expect_failure 'could not connect to 127.0.0.1:1' record --test-pattern -t 1 --stream rtmp://127.0.0.1:1/live/key -o "$tmp/refused.mov"
+  received="$artifacts/stream-server"
+  start_mediamtx "$(get_mediamtx "$root/build/tools")" "$received" "$tmp/mediamtx"
+  # Stem-only file: the stream still carries the mix.
+  "$rec" record --test-pattern --test-tone --test-mic --audio-tracks stems -r 720p -f 30 -t 4 \
+    --stream rtmp://127.0.0.1:1935/live/smokekey1 -o "$artifacts/stream-local.mov" | tee "$artifacts/stream.record.log"
+  grep -q 'Streaming to rtmp://127.0.0.1:1935/live/\*\*\*\*' "$artifacts/stream.record.log"
+  grep -q 'Streamed 120 frames' "$artifacts/stream.record.log"
+  grep -q 'skipped 0' "$artifacts/stream.record.log"
+  if grep -q smokekey1 "$artifacts/stream.record.log"; then echo 'the stream key was printed' >&2; exit 1; fi
+  "$rec" probe "$artifacts/stream-local.mov" | tee "$artifacts/stream-local.probe"
+  grep -qx 'audio_tracks=2' "$artifacts/stream-local.probe"
+  # MediaMTX analyzes 2 s of media before it records, so streams here run longer than that.
+  "$rec" record --test-pattern -r 720p -f 30 -t 3 --stream rtmp://127.0.0.1:1935/live/smokekey2 \
+    -o "$artifacts/stream-silent-local.mov" | tee "$artifacts/stream-silent.record.log"
+  grep -q 'Streamed 90 frames' "$artifacts/stream-silent.record.log"
+
+  # Losing the server ends the stream, not the recording.
+  "$rec" record --test-pattern --test-tone -r 720p -f 30 -t 4 --stream rtmp://127.0.0.1:1935/live/smokekey3 \
+    -o "$artifacts/stream-lost.mov" </dev/null >"$artifacts/stream-lost.record.log" 2>&1 &
+  lost_pid="$!"
+  sleep 2
+  stop_mediamtx
+  if wait "$lost_pid"; then cat "$artifacts/stream-lost.record.log" >&2; echo 'a lost stream was not reported' >&2; exit 1; fi
+  cat "$artifacts/stream-lost.record.log"
+  grep -q 'Stream stopped early' "$artifacts/stream-lost.record.log"
+  grep -q 'written 120, dropped 0' "$artifacts/stream-lost.record.log"
+  if grep -q 'Streamed 120 frames' "$artifacts/stream-lost.record.log"; then
+    echo 'frames after the loss were counted as streamed' >&2; exit 1
+  fi
+  "$rec" probe "$artifacts/stream-lost.mov" | grep -qx 'frames=120'
+
+  for key in smokekey1 smokekey2; do
+    file="$(find "$received/live/$key" -name '*.mp4' -print -quit)"
+    [[ -n "$file" ]] || { echo "MediaMTX recorded nothing for $key" >&2; exit 1; }
+    "$rec" probe "$file" | tee "$artifacts/stream-received-$key.probe"
+  done
+  got="$artifacts/stream-received-smokekey1.probe"
+  grep -qx 'codec=h264' "$got"
+  grep -qx 'width=1280' "$got"
+  grep -qx 'height=720' "$got"
+  # MediaMTX's MP4 writer drops the final frame, whose duration it cannot know.
+  within "$(value frames "$got")" 119 120
+  grep -qx 'audio_tracks=1' "$got"
+  grep -qx 'audio_codec=aac' "$got"
+  within "$(value audio_duration "$got")" 3.9 4.05
+  within "$(value av_sync_events "$got")" 4 4
+  within "$(value av_offset_max_ms "$got")" 0 20
+  within "$(value frames "$artifacts/stream-received-smokekey2.probe")" 89 90
+  grep -qx 'audio_codec=aac' "$artifacts/stream-received-smokekey2.probe"
   "$rec" record --test-pattern -r 1080p -f 30 -t 1 --codec hevc -o "$artifacts/hevc.mp4" | tee "$artifacts/hevc.record.log"
   "$rec" probe "$artifacts/hevc.mp4" | tee "$artifacts/hevc.probe"
   grep -qx 'codec=hevc' "$artifacts/hevc.probe"

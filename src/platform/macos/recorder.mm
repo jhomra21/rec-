@@ -11,6 +11,7 @@
 #include "core/mixer.hpp"
 #include "core/pause.hpp"
 #include "core/sync.hpp"
+#include "platform/macos/stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -445,7 +447,8 @@ public:
     Result start() {
         @autoreleasepool {
             if (active_) return {"already recording"};
-            if (!options_.stream_url.empty()) return {"streaming is not available on macOS yet"};
+            if (!options_.stream_url.empty() && (options_.stream_kbps < 500 || options_.stream_kbps > 50000))
+                return {"stream bitrate must be between 500 and 50000 kb/s"};
             if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
             if ((options_.test_tone || options_.test_mic) && !options_.test_pattern)
                 return {"synthetic audio needs the test pattern"};
@@ -478,6 +481,16 @@ public:
                 if (!pattern_[0] || !pattern_[1]) { stop(); return {"synthetic frame allocation failed"}; }
                 captured_.store(1);
                 active_.store(true);
+            }
+            if (!options_.stream_url.empty()) {
+                mac::LiveSettings live;
+                live.url = options_.stream_url;
+                live.width = size_.width;
+                live.height = size_.height;
+                live.fps = options_.fps;
+                live.video_kbps = options_.stream_kbps;
+                live_ = std::make_unique<mac::LiveStream>();
+                if (auto started = live_->start(live); !started) { stop(); return {"stream: " + started.error}; }
             }
             auto ready = create_writer();
             if (!ready) { stop(); return ready; }
@@ -532,6 +545,7 @@ public:
                 input_ = nil;
                 writer_ = nil;
             }
+            if (live_) live_->stop();
             if (activity_) { [[NSProcessInfo processInfo] endActivity:activity_]; activity_ = nil; }
             recording_.store(false);
             {
@@ -600,9 +614,18 @@ public:
         stats.system_audio_offset_ms = audio_[kSystem].enabled ? system_offset_ms_ : 0;
         stats.paused = timeline_.paused();
         stats.paused_seconds = static_cast<double>(timeline_.paused_total(now_nanos())) / kNanos;
+        if (live_) {
+            const auto live = live_->counters();
+            stats.streaming = live.live;
+            stats.stream_hardware = live.hardware;
+            stats.stream_frames = live.frames;
+            stats.stream_dropped = live.dropped;
+            stats.stream_bytes = live.bytes;
+        }
         return stats;
     }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
+    std::string stream_failure() const { return live_ ? live_->failure() : std::string(); }
 
     Result pause() {
         if (!recording_.load() || finished_.load()) return {"not recording"};
@@ -649,8 +672,9 @@ private:
         config.height = size_.height;
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
         config.minimumFrameInterval = CMTimeMake(9, static_cast<int32_t>(options_.fps * 10));
-        // Up to three pending frames plus the current one and the encoder's in-flight surfaces.
-        config.queueDepth = 6;
+        // Up to three pending frames plus the current one and the encoder's in-flight surfaces;
+        // a live stream's queue and encoder hold a few more.
+        config.queueDepth = options_.stream_url.empty() ? 6 : 8;
         config.showsCursor = options_.cursor;
         config.capturesAudio = options_.system_audio;
         config.sampleRate = kMixRate;
@@ -751,15 +775,17 @@ private:
         [writer_ addInput:input_];
 
         // Track order is the order inputs are added: the mix first, so it is the default track.
+        // A live stream always carries the mix, even when the file keeps only stems.
         const bool system = audio_[kSystem].enabled, mic = audio_[kMic].enabled;
-        mixing_ = system && mic && options_.audio_tracks != AudioTracks::stems;
-        const bool stems = !mixing_ || options_.audio_tracks == AudioTracks::both;
+        const bool file_mix = system && mic && options_.audio_tracks != AudioTracks::stems;
+        mixing_ = file_mix || (system && mic && live_);
+        const bool stems = !file_mix || options_.audio_tracks == AudioTracks::both;
         NSMutableArray<AVAssetWriterInput*>* audio_inputs = [NSMutableArray array];
-        if (mixing_) {
+        if (mixing_) mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
+        if (file_mix) {
             mix_input_ = add_audio_input(2, 256000);
             if (!mix_input_) return {"AAC writer cannot accept the audio mix"};
             [audio_inputs addObject:mix_input_];
-            mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
             mix_format_ = pcm_format(2, true);
             if (!mix_format_) return {"could not describe the audio mix format"};
         }
@@ -859,7 +885,8 @@ private:
                     fail(message(writer_.error, "audio encoding failed"));
             }
         }
-        if (mixing_) {
+        // A single source goes to the live stream as it is; two go through the mix.
+        if (mixing_ || live_) {
             if (stereo_pcm(sample, pcm_, scratch_)) {
                 auto first = static_cast<std::int64_t>(std::llround(CMTimeGetSeconds(start) * kMixRate));
                 // Timestamps jitter by a sample or two; keep a continuous stream continuous.
@@ -867,7 +894,8 @@ private:
                     first = source.next_mix;
                 const auto frames = pcm_.size() / 2;
                 source.next_mix = first + static_cast<std::int64_t>(frames);
-                mixer_.add(kind, first, pcm_.data(), frames, source.gain);
+                if (mixing_) mixer_.add(kind, first, pcm_.data(), frames, source.gain);
+                else live_->audio(first, pcm_.data(), frames);
                 used = true;
             } else if (!source.stem) {
                 source.dropped.fetch_add(1);
@@ -878,7 +906,7 @@ private:
     }
 
     void emit_mix(bool flush) {
-        if (!mixing_ || !mix_input_) return;
+        if (!mixing_) return;
         const auto system_end = mixer_.end(kSystem), mic_end = mixer_.end(kMic);
         std::int64_t target = flush ? std::max(system_end, mic_end) : std::min(system_end, mic_end);
         if (!flush && !options_.test_pattern) {
@@ -887,7 +915,7 @@ private:
         }
         target = std::min(target, mixer_.emitted() + mixer_.capacity());
         while (mixer_.emitted() < target) {
-            if (!mix_input_.readyForMoreMediaData) {
+            if (mix_input_ && !mix_input_.readyForMoreMediaData) {
                 if (!flush) return;
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
                 while (!mix_input_.readyForMoreMediaData && std::chrono::steady_clock::now() < deadline)
@@ -897,6 +925,8 @@ private:
             const auto first = mixer_.emitted();
             const auto frames = static_cast<std::size_t>(std::min<std::int64_t>(target - first, 4096));
             mixer_.take(frames, mixed_);
+            if (live_) live_->audio(first, mixed_.data(), frames);
+            if (!mix_input_) continue;
             CMSampleBufferRef sample = pcm_buffer(mix_format_, mixed_.data(), mixed_.size() * sizeof(float),
                                                   frames, CMTimeMake(first, kMixRate));
             if (!sample) { fail("could not create an audio mix buffer"); return; }
@@ -1025,6 +1055,12 @@ private:
                 }
                 if (appended) {
                     written_.fetch_add(1);
+                    if (live_) {
+                        live_->video(frame, slot);
+                        // A stream without audio sources still carries a silent AAC track; services expect one.
+                        if (!audio_[kSystem].enabled && !audio_[kMic].enabled)
+                            live_->audio(0, nullptr, static_cast<std::size_t>((slot + 1) * kMixRate / options_.fps));
+                    }
                     if ((options_.test_tone || options_.test_mic) &&
                         !write_synthetic_audio(((slot + 1) * static_cast<std::uint64_t>(kMixRate)) / options_.fps) &&
                         !stop_requested_.load())
@@ -1085,6 +1121,7 @@ private:
     std::atomic_bool recording_{false};
     std::atomic_bool finished_{false};
     std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0}, mix_written_{0};
+    std::unique_ptr<mac::LiveStream> live_;  // Kept after stop() for its counters.
 };
 
 namespace {
@@ -1233,6 +1270,6 @@ bool Recorder::running() const noexcept { return impl_->capture.running(); }
 bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
 Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }
 std::string Recorder::failure() const { return impl_->capture.failure(); }
-std::string Recorder::stream_failure() const { return {}; }
+std::string Recorder::stream_failure() const { return impl_->capture.stream_failure(); }
 
 } // namespace rec
