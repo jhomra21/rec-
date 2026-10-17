@@ -2,7 +2,7 @@
 
 A compact screen recorder for macOS and Windows, built with C++20 and each platform's native capture and hardware encoding frameworks.
 
-Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone passes the flash/beep sync test on a Mac (M3 Pro) and on a Windows PC; see the Mac evidence ([run 1](docs/evidence/2026-10-16-live-test/README.md), [run 2](docs/evidence/2026-10-16-run2/README.md), [run 3](docs/evidence/2026-10-16-run3/README.md)) and the Windows measurements below. Camera overlays, window selection, pause/resume, replay and streaming are not implemented.
+Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone passes the flash/beep sync test on a Mac (M3 Pro) and on a Windows PC; see the Mac evidence ([run 1](docs/evidence/2026-10-16-live-test/README.md), [run 2](docs/evidence/2026-10-16-run2/README.md), [run 3](docs/evidence/2026-10-16-run3/README.md)) and the Windows measurements below. Recordings can be paused and resumed, and a crash leaves a playable file. Camera overlays, window selection, replay and streaming are not implemented.
 
 ## Build
 
@@ -39,6 +39,16 @@ You can stop an unlimited recording with Ctrl-C:
 ```sh
 ./build/rec record --duration 0 --codec hevc -o capture.mp4
 ```
+
+### Pause, resume and crash safety
+
+While recording in a terminal, press `p` or space to pause and resume, and `q` or Ctrl-C to stop. The status line shows PAUSED and the recorded time. Paused time is cut from the movie: video and every audio track continue without a gap, and `-t` counts recorded time, not wall time. When stdin is piped, rec reads one command per line (`pause`, `resume`, `toggle`, `stop`), so scripts and other programs can drive a recording:
+
+```sh
+{ sleep 5; echo pause; sleep 3; echo resume; } | ./build/rec record -t 10 -o demo.mov
+```
+
+Recordings are written in fragments, so a crash, kill or power loss keeps everything up to the last fragment (about 1 s on macOS). On macOS a normal stop turns the fragments into a regular movie. On Windows, H.264 files stay fragmented MP4, which players read normally. Windows HEVC uses the regular MP4 writer and is **not** crash-safe, because Windows' fragmented MP4 writer rejects HEVC.
 
 `rec::Recorder` in `include/rec/rec.hpp` is the public library API. The CLI uses the same engine. IOSurface-backed pixel buffers go to AVAssetWriter without CPU pixel copying. It uses ScreenCaptureKit for resizing in this initial version.
 
@@ -103,6 +113,9 @@ One run each on a Windows 11 (26200) PC with an RTX 5070 Ti driving a 3840x2160 
 | `scripts/smoke.ps1` with `REC_E2E_CAPTURE=1` | Passed: synthetic offset ≤ 10.8 ms, 100 ms offset flag measured 100.2 ms, 1/2/3-track layouts, HEVC, real 3 s capture with 90/90 frames |
 | `scripts/e2e-live-audio.ps1` (display + system audio) | 7 flash/beep pairs, mean −12.8 ms, worst 13.3 ms; 720/720 frames, 0 dropped |
 | Same with `REC_E2E_MIC=1` | 3 audio tracks, 7 pairs, mean −11.9 ms, worst 17.2 ms; 0 dropped |
+| After pause/resume and fragmented MP4, display + system audio | 7 pairs, mean −22.2 ms, worst 22.5 ms; 720/720 frames |
+| Same with `REC_E2E_MIC=1 REC_E2E_PAUSE=1` (2 s pause mid-stimulus) | 720/720 frames, 12.01 s of audio on 3 tracks, 7 pairs, mean −24.8 ms, worst 27.9 ms; 0 dropped |
+| Hard kill 4 s into an H.264 recording (`smoke.ps1`) | File decodes: 90 frames, 3 flash/beep pairs within 10.8 ms |
 | 15 s, 1080p60 H.264, system audio + mic | 900/900 frames; 1.1–2.0 s CPU total (7–13% of one core); peak working set 119 MB |
 | 15 s, native 4K60 HEVC, system audio | 900/900 frames; 0.9–1.0 s CPU total (about 6% of one core); peak working set 116 MB |
 | `rec.exe` size | 150 KB |
@@ -112,6 +125,8 @@ Most of the working set and private memory belongs to the GPU driver's Direct3D 
 ## Current limits
 
 - Capture is display-only.
+- Pausing a live recording on macOS cuts audio per capture buffer (about 10–20 ms), so a sound that spans the pause can leave up to one buffer at the cut. Windows cuts at the exact sample.
+- Windows HEVC recordings are not crash-safe (see above).
 - Windows loopback captures the default output device. rec plays silence on it while recording so the audio clock keeps moving when nothing else plays.
 - The output latency is read once, when recording starts. Switching output devices mid-recording keeps the old offset.
 - A microphone that is not 48 kHz is resampled linearly per buffer for the mix. Its stem is converted by AVFoundation.

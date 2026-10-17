@@ -19,8 +19,8 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Mixed audio and separate stems | Synthetic and live mix + stems verified on macOS and Windows | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
 | Single-clock A/V sync | Timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; live 12 s runs within 43.7 ms (macOS) and 17.2 ms (Windows) | 30-minute drift |
 | Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
-| Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
-| Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
+| Pause/resume | Implemented on both (API, keys, piped stdin). Synthetic 1.5 s pause passes on macOS CI and Windows (90/90 frames, 3 tracks, sync ≤ 10.8 ms); Windows live 2 s pause with system audio + mic: 720/720 frames, worst 27.9 ms | Live pause on a Mac; repeated pauses in one recording; pause during encoder backpressure |
+| Fragmented/crash-safe output | macOS: 1 s movie fragments, consolidated on finish. Windows: fragmented MP4 for H.264 (HEVC not crash-safe). Hard kill after 4 s decodes with sync on macOS CI and Windows | Power loss on real hardware; Windows HEVC |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
 | Synthetic video + tone E2E | Passed on macOS CI and on a Mac; passed locally on Windows | Encoded movies + complete decoder probe saved as CI artifacts |
 | Synthetic flash/beep sync, mixer and track layouts | Passed on macOS CI; passed locally on Windows | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
@@ -44,7 +44,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Scene presets and switching | Missing | Screen, screen+cam and camera switching without stopping |
 | Floating camera layout controls | Missing | Drag/snap, circle/rounded/square/pill/squircle, border/shadow |
 | Audio meters | Missing | Per-source peak meters, no render work while hidden |
-| CLI recording status | Implemented (TTY only) | Elapsed time and drops visible while recording |
+| CLI recording status | Implemented (TTY only): recorded time, PAUSED, drops | Elapsed time and drops visible while recording |
 | Menu bar and Dock behavior | Missing | Start/pause/stop/save/quit, finalized file on exit |
 | Global hotkeys | Missing | Registered/unregistered safely, conflicts visible |
 | Settings persistence | Missing | No recording corruption on invalid/stale settings |
