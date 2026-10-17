@@ -117,11 +117,15 @@ One run each on a Windows 11 (26200) PC with an RTX 5070 Ti driving a 3840x2160 
 | After pause/resume and fragmented MP4, display + system audio | 7 pairs, mean −22.2 ms, worst 22.5 ms; 720/720 frames |
 | Same with `REC_E2E_MIC=1 REC_E2E_PAUSE=1` (2 s pause mid-stimulus) | 720/720 frames, 12.01 s of audio on 3 tracks, 7 pairs, mean −24.8 ms, worst 27.9 ms; 0 dropped |
 | Hard kill 4 s into an H.264 recording (`smoke.ps1`) | File decodes: 90 frames, 3 flash/beep pairs within 10.8 ms |
+| 4 more plain live runs, next day | 7 pairs each, means −22.3 to −26.2 ms, worst 39.9 ms; 720/720 frames, 0 dropped |
+| Same day, old build `b03e40e` with its original script | Means −25.1 and −23.3 ms |
 | 15 s, 1080p60 H.264, system audio + mic | 900/900 frames; 1.1–2.0 s CPU total (7–13% of one core); peak working set 119 MB |
 | 15 s, native 4K60 HEVC, system audio | 900/900 frames; 0.9–1.0 s CPU total (about 6% of one core); peak working set 116 MB |
 | `rec.exe` size | 150 KB |
 
 Most of the working set and private memory belongs to the GPU driver's Direct3D allocations, not recorder buffers.
+
+The live mean moved from about −12 ms on the first day to about −24 ms the next. The build that measured −12 ms measures −24 ms on the same day too, so the move comes from this PC's display or audio path, not from rec. Live offsets on one machine can shift by about 10 ms between sessions.
 
 ## Current limits
 
