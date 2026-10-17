@@ -90,6 +90,31 @@ else
   "$rec" probe "$artifacts/mixonly.mov" | tee "$artifacts/mixonly.probe"
   grep -qx 'audio_tracks=1' "$artifacts/mixonly.probe"
 
+  # Pause/resume through piped stdin: paused time is cut from the movie, A/V stays in sync.
+  { sleep 1; echo pause; sleep 1.5; echo resume; sleep 6; } |
+    "$rec" record --test-pattern --test-tone --test-mic -f 30 -t 3 -o "$artifacts/pause.mov" | tee "$artifacts/pause.record.log"
+  "$rec" probe "$artifacts/pause.mov" | tee "$artifacts/pause.probe"
+  grep -q 'Paused at' "$artifacts/pause.record.log"
+  grep -q 'Resumed at' "$artifacts/pause.record.log"
+  grep -q 'written 90, dropped 0' "$artifacts/pause.record.log"
+  within "$(awk '/^Paused [0-9.]+ s/ { print $2 }' "$artifacts/pause.record.log")" 1.3 1.7
+  grep -qx 'frames=90' "$artifacts/pause.probe"
+  grep -qx 'audio_tracks=3' "$artifacts/pause.probe"
+  within "$(value audio_duration "$artifacts/pause.probe")" 2.95 3.05
+  within "$(value av_sync_events "$artifacts/pause.probe")" 3 3
+  within "$(value av_offset_max_ms "$artifacts/pause.probe")" 0 20
+
+  # Crash safety: a recording killed mid-write still decodes up to its last movie fragment.
+  "$rec" record --test-pattern --test-tone -f 30 -t 0 --codec h264 -o "$artifacts/crash.mov" \
+    </dev/null >"$artifacts/crash.record.log" 2>&1 &
+  crash_pid="$!"
+  sleep 4
+  kill -9 "$crash_pid"
+  wait "$crash_pid" || true
+  "$rec" probe "$artifacts/crash.mov" | tee "$artifacts/crash.probe"
+  within "$(value frames "$artifacts/crash.probe")" 60 120
+  within "$(value av_sync_events "$artifacts/crash.probe")" 2 4
+  within "$(value av_offset_max_ms "$artifacts/crash.probe")" 0 20
   "$rec" record --test-pattern -r 1080p -f 30 -t 1 --codec hevc -o "$artifacts/hevc.mp4" | tee "$artifacts/hevc.record.log"
   "$rec" probe "$artifacts/hevc.mp4" | tee "$artifacts/hevc.probe"
   grep -qx 'codec=hevc' "$artifacts/hevc.probe"

@@ -61,3 +61,31 @@ function Expect-Within($probe, [string]$key, [double]$low, [double]$high) {
 function Expect-Text([string]$text, [string]$expected) {
     if (-not $text.Contains($expected)) { throw "expected '$expected' in: $text" }
 }
+
+# Starts rec with a writable stdin, for pause/resume/stop commands. Read the result with
+# Stop-RecProcess.
+function Start-RecProcess([string]$rec, [string[]]$arguments) {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $rec
+    $info.Arguments = ($arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+    $info.UseShellExecute = $false
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($info)
+    # Read both pipes asynchronously so a full pipe can never stall the recorder.
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    return @{ Process = $process; Stdout = $stdout; Stderr = $stderr }
+}
+
+function Send-RecCommand($run, [string]$command) {
+    $run.Process.StandardInput.WriteLine($command)
+    $run.Process.StandardInput.Flush()
+}
+
+function Stop-RecProcess($run, [int]$timeoutSeconds = 60) {
+    if (-not $run.Process.WaitForExit($timeoutSeconds * 1000)) { $run.Process.Kill(); throw 'rec did not exit' }
+    $run.Process.WaitForExit()
+    return @{ Code = $run.Process.ExitCode; Text = ($run.Stdout.Result + $run.Stderr.Result).Trim() }
+}

@@ -16,6 +16,8 @@ Recorder::Recorder(Options) : impl_(std::make_unique<Impl>()) {}
 Recorder::~Recorder() = default;
 Result Recorder::start() { return {"screen capture requires macOS 15 or Windows 10 (1903) or newer"}; }
 Result Recorder::stop() { return {}; }
+Result Recorder::pause() { return {"not recording"}; }
+Result Recorder::resume() { return {"not recording"}; }
 bool Recorder::running() const noexcept { return false; }
 bool Recorder::finished() const noexcept { return true; }
 Stats Recorder::stats() const noexcept { return {}; }

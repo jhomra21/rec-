@@ -63,6 +63,8 @@ struct Stats {
     std::uint64_t mic_dropped = 0;
     std::uint64_t mix_written = 0;
     double system_audio_offset_ms = 0;
+    bool paused = false;
+    double paused_seconds = 0; // Total time paused, excluded from the movie.
 };
 
 struct Probe {
@@ -103,6 +105,9 @@ public:
 
     Result start();
     Result stop(); // Finalizes the output before returning.
+    // The movie skips paused time: video and audio continue gaplessly after resume().
+    Result pause();
+    Result resume();
     bool running() const noexcept;
     bool finished() const noexcept; // Duration reached or capture failed.
     Stats stats() const noexcept;

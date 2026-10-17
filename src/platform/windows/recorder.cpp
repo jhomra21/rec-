@@ -31,6 +31,7 @@
 
 #include "rec/rec.hpp"
 #include "core/mixer.hpp"
+#include "core/pause.hpp"
 #include "core/sync.hpp"
 
 #include <algorithm>
@@ -635,6 +636,7 @@ public:
         finished_.store(false);
         stop_requested_.store(false);
         origin_ = now_ticks();
+        timeline_.reset(origin_);
         audio_cap_ = options_.duration_seconds > 0
             ? std::llround(options_.duration_seconds * options_.fps) * kMixRate / options_.fps : INT64_MAX;
         begin_ = std::chrono::steady_clock::now();
@@ -714,9 +716,22 @@ public:
             (audio_[kMic].capture ? audio_[kMic].capture->overflowed() : 0);
         stats.mix_written = mix_written_.load();
         stats.system_audio_offset_ms = audio_[kSystem].enabled ? system_offset_ms_ : 0;
+        stats.paused = timeline_.paused();
+        stats.paused_seconds = static_cast<double>(timeline_.paused_total(now_ticks())) / kTicks;
         return stats;
     }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
+
+    Result pause() {
+        if (!recording_.load() || finished_.load()) return {"not recording"};
+        if (!timeline_.pause(now_ticks())) return {"already paused"};
+        return {};
+    }
+    Result resume() {
+        if (!recording_.load() || finished_.load()) return {"not recording"};
+        if (!timeline_.resume(now_ticks())) return {"not paused"};
+        return {};
+    }
 
 private:
     void fail(std::string text) {
@@ -958,9 +973,8 @@ private:
 
     // The frame on screen at the slot's instant: the newest converted frame whose
     // timestamp is not after it.
-    int select_frame(std::uint64_t slot) {
+    int select_frame(std::uint64_t slot, std::int64_t due) {
         if (options_.test_pattern) return core::test_flash(slot, options_.fps) ? 1 : 0;
-        const std::int64_t due = origin_ + static_cast<std::int64_t>(slot) * kTicks / options_.fps;
         std::lock_guard lock(mutex_);
         while (pending_count_ && (current_ < 0 || slots_[pending_[pending_head_]].time <= due)) {
             if (current_ >= 0) slots_[current_].state = SlotState::free;
@@ -976,8 +990,12 @@ private:
         ComPtr<IMFAttributes> attributes;
         MFCreateAttributes(&attributes, 3);
         attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        // Media Foundation writes ISO MP4. A .mov output is the same ISO structure, which QuickTime reads.
-        attributes->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        // Fragmented MP4: a crash or power loss leaves every completed fragment playable.
+        // Windows' fragmented sink takes H.264 only, so HEVC uses the regular MP4 sink.
+        // A .mov output is the same ISO structure, which QuickTime reads.
+        const bool hevc = options_.codec == Codec::hevc ||
+            (options_.codec == Codec::automatic && size_.height > 1080);
+        attributes->SetGUID(MF_TRANSCODE_CONTAINERTYPE, hevc ? MFTranscodeContainerType_MPEG4 : MFTranscodeContainerType_FMPEG4);
         if (manager_) attributes->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, manager_.Get());
         HRESULT hr = MFCreateSinkWriterFromURL(wide(options_.output).c_str(), nullptr, attributes.Get(), &writer_);
         if (FAILED(hr)) return {failed("could not create output movie", hr)};
@@ -1009,8 +1027,6 @@ private:
             mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
         }
 
-        const bool hevc = options_.codec == Codec::hevc ||
-            (options_.codec == Codec::automatic && size_.height > 1080);
         const std::uint32_t bitrate = (options_.bitrate_mbps ? options_.bitrate_mbps
             : (size_.height > 1440 ? 50u : size_.height > 1080 ? 30u : 20u)) * 1000000u;
         auto output = video_type(hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264, size_, options_.fps);
@@ -1115,10 +1131,8 @@ private:
 
     // Places one chunk of 48 kHz stereo on the recording timeline: its stem (with silence
     // filling any gap, so tracks stay continuous) and the mix.
-    void process_chunk(Source kind, std::int64_t time, const float* data, std::size_t frames) {
+    void place(Source kind, std::int64_t start, const float* data, std::size_t frames) {
         auto& source = audio_[kind];
-        auto start = static_cast<std::int64_t>(
-            std::llround(static_cast<double>(time - origin_ + source.offset) * kMixRate / kTicks));
         // Timestamps jitter by a sample or two; keep a continuous stream continuous.
         if (source.next != INT64_MIN && std::llabs(start - source.next) <= kMixRate / 1000) start = source.next;
         const std::int64_t floor = source.next == INT64_MIN ? 0 : source.next;
@@ -1143,11 +1157,26 @@ private:
         else source.dropped.fetch_add(1);
     }
 
+    // Captured audio is stamped on QPC; paused spans are cut out at the same instants as video.
+    void route(Source kind, const AudioChunk& chunk) {
+        const auto host = chunk.time + audio_[kind].offset;
+        const auto length = static_cast<std::int64_t>(chunk.frames) * kTicks / kMixRate;
+        const auto to_frames = [](std::int64_t ticks) { return std::llround(static_cast<double>(ticks) * kMixRate / kTicks); };
+        for (const auto& piece : timeline_.kept(host, length)) {
+            const auto skip = std::min<std::int64_t>(to_frames(piece.skip), chunk.frames);
+            const auto count = piece.skip == 0 && piece.length == length
+                ? static_cast<std::int64_t>(chunk.frames)
+                : std::min<std::int64_t>(to_frames(piece.length), chunk.frames - skip);
+            if (count > 0)
+                place(kind, to_frames(piece.output), chunk.data.data() + skip * 2, static_cast<std::size_t>(count));
+        }
+    }
+
     void emit_mix(bool flush) {
         if (!mixing_ || mix_stream_ < 0) return;
         std::int64_t target = flush ? video_end_samples() : std::min(mixer_.end(kSystem), mixer_.end(kMic));
         if (!flush && !options_.test_pattern)
-            target = std::max(target, (now_ticks() - origin_) * kMixRate / kTicks - kMixWaitFrames);
+            target = std::max(target, timeline_.to_output(now_ticks()).output * kMixRate / kTicks - kMixWaitFrames);
         target = std::min(target, audio_cap_);
         while (mixer_.emitted() < target) {
             const auto first = mixer_.emitted();
@@ -1168,7 +1197,7 @@ private:
             auto& source = audio_[kind];
             if (!source.capture) continue;
             for (int chunks = 0; chunks < 64 && source.capture->pop(chunk_); ++chunks)
-                process_chunk(kind, chunk_.time, chunk_.data.data(), chunk_.frames);
+                route(kind, chunk_);
         }
         if (flush) {
             // Pad stems to the end of the video so every track spans the recording.
@@ -1188,14 +1217,16 @@ private:
         std::array<float, 2048> tone{}, mic{};
         while (synthetic_samples_ < until && !stop_requested_.load() && !finished_.load()) {
             const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(1024, until - synthetic_samples_));
-            const std::int64_t time = origin_ + static_cast<std::int64_t>(
-                std::llround(static_cast<double>(synthetic_samples_) * kTicks / kMixRate));
+            const auto start = static_cast<std::int64_t>(synthetic_samples_);
+            const auto shifted = [&](Source kind) {
+                return start + std::llround(static_cast<double>(audio_[kind].offset) * kMixRate / kTicks);
+            };
             for (std::size_t i = 0; i < count; ++i) {
                 tone[i * 2] = tone[i * 2 + 1] = core::test_tone(synthetic_samples_ + i);
                 mic[i * 2] = mic[i * 2 + 1] = core::test_mic(synthetic_samples_ + i);
             }
-            if (options_.test_tone) process_chunk(kSystem, time, tone.data(), count);
-            if (options_.test_mic) process_chunk(kMic, time, mic.data(), count);
+            if (options_.test_tone) place(kSystem, shifted(kSystem), tone.data(), count);
+            if (options_.test_mic) place(kMic, shifted(kMic), mic.data(), count);
             synthetic_samples_ += count;
         }
     }
@@ -1207,10 +1238,27 @@ private:
         const auto limit = options_.duration_seconds > 0
             ? static_cast<std::uint64_t>(std::llround(options_.duration_seconds * options_.fps)) : UINT64_MAX;
         for (std::uint64_t slot = 0; slot < limit && !stop_requested_.load() && !finished_; ++slot) {
-            const auto tick = begin_ + nanoseconds(slot * 1000000000ull / options_.fps) + delay;
-            std::this_thread::sleep_until(tick);
+            const auto output = static_cast<std::int64_t>(slot) * kTicks / options_.fps;
+            std::int64_t due = 0;
+            steady_clock::time_point tick;
+            // Wait for the slot's host instant. A pause can begin while waiting; then the
+            // slot waits for resume() and lands after it, so the movie has no gap.
+            for (;;) {
+                if (stop_requested_.load() || finished_.load()) break;
+                const auto host = timeline_.to_host(output);
+                if (!host) {
+                    pump_audio(false);
+                    std::this_thread::sleep_for(milliseconds(5));
+                    continue;
+                }
+                due = *host;
+                tick = begin_ + nanoseconds((due - origin_) * 100) + delay;
+                const auto now = steady_clock::now();
+                if (now >= tick) break;
+                std::this_thread::sleep_until(std::min(tick, now + milliseconds(10)));
+            }
             if (stop_requested_.load() || finished_) break;
-            const int frame = select_frame(slot);
+            const int frame = select_frame(slot, due);
             // Retry the same timestamp for up to 500 ms on transient backpressure.
             bool appended = false;
             const auto deadline = tick + milliseconds(500);
@@ -1280,6 +1328,7 @@ private:
     std::vector<float> mixed_;
     std::uint64_t synthetic_samples_ = 0;
     std::uint64_t video_end_slot_ = 0;
+    core::PauseTimeline timeline_;
     std::int64_t audio_cap_ = INT64_MAX;  // Recording-timeline samples; audio at or past it is dropped.
 
     std::int64_t origin_ = 0;
@@ -1445,6 +1494,8 @@ Recorder::Recorder(Options options) : impl_(std::make_unique<Impl>(std::move(opt
 Recorder::~Recorder() = default;
 Result Recorder::start() { return impl_->capture.start(); }
 Result Recorder::stop() { return impl_->capture.stop(); }
+Result Recorder::pause() { return impl_->capture.pause(); }
+Result Recorder::resume() { return impl_->capture.resume(); }
 bool Recorder::running() const noexcept { return impl_->capture.running(); }
 bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
 Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }

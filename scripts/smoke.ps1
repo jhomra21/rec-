@@ -82,6 +82,41 @@ try {
     $mixonly = Record 'mixonly' 'mixonly.mp4' @('--test-pattern', '--test-tone', '--test-mic', '--audio-tracks', 'mix', '-f', '30', '-t', '1')
     Expect-Field $mixonly.Probe 'audio_tracks' '1'
 
+    # Pause/resume through piped stdin: paused time is cut from the movie, A/V stays in sync.
+    $pausePath = Join-Path $artifacts 'pause.mp4'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '--test-mic', '-f', '30', '-t', '3', '-o', $pausePath)
+    Start-Sleep -Milliseconds 1000
+    Send-RecCommand $run 'pause'
+    Start-Sleep -Milliseconds 1500
+    Send-RecCommand $run 'resume'
+    $paused = Stop-RecProcess $run
+    $watch.Stop()
+    Set-Content -Path (Join-Path $artifacts 'pause.record.log') -Value $paused.Text
+    Write-Host $paused.Text
+    if ($paused.Code -ne 0) { throw "paused recording failed: $($paused.Text)" }
+    Expect-Text $paused.Text 'Paused at'
+    Expect-Text $paused.Text 'Resumed at'
+    Expect-Text $paused.Text 'written 90, dropped 0'
+    Expect-Text $paused.Text 'not in the movie'
+    if ($watch.Elapsed.TotalSeconds -lt 4.2) { throw "pause did not hold the recording ($($watch.Elapsed.TotalSeconds) s)" }
+    $pause = Get-Probe $rec $pausePath (Join-Path $artifacts 'pause.probe')
+    Expect-Field $pause 'frames' '90'
+    Expect-Field $pause 'audio_tracks' '3'
+    Expect-Within $pause 'audio_duration' 2.95 3.05
+    Expect-Within $pause 'av_sync_events' 3 3
+    Expect-Within $pause 'av_offset_max_ms' 0 20
+
+    # Crash safety: a recording killed mid-write still decodes up to its last fragment.
+    $crashPath = Join-Path $artifacts 'crash.mp4'
+    $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '-f', '30', '-t', '0', '--codec', 'h264', '-o', $crashPath)
+    Start-Sleep -Seconds 4
+    $run.Process.Kill()
+    $run.Process.WaitForExit()
+    $crash = Get-Probe $rec $crashPath (Join-Path $artifacts 'crash.probe')
+    Expect-Within $crash 'frames' 60 120
+    Expect-Within $crash 'av_sync_events' 2 4
+    Expect-Within $crash 'av_offset_max_ms' 0 20
     # HEVC needs a hardware encoder or the HEVC Video Extensions; GPU-less CI runners have neither.
     $hevcPath = Join-Path $artifacts 'hevc.mp4'
     $hevcRun = Invoke-Rec $rec @('record', '--test-pattern', '-r', '1080p', '-f', '30', '-t', '1', '--codec', 'hevc', '-o', $hevcPath)

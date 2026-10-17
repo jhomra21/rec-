@@ -9,6 +9,7 @@
 
 #include "rec/rec.hpp"
 #include "core/mixer.hpp"
+#include "core/pause.hpp"
 #include "core/sync.hpp"
 
 #include <algorithm>
@@ -63,6 +64,12 @@ using core::kMixRate;
 constexpr auto kEmitDelay = std::chrono::milliseconds(40);
 // A stalled source holds the mix back at most this long; it is then filled with silence.
 constexpr std::int64_t kMixWaitFrames = kMixRate * 3 / 10;
+
+constexpr std::int32_t kNanos = 1000000000;
+
+// Host-clock instants as integer nanoseconds, the unit of the pause timeline.
+std::int64_t nanos(CMTime time) { return CMTimeConvertScale(time, kNanos, kCMTimeRoundingMethod_RoundHalfAwayFromZero).value; }
+std::int64_t now_nanos() { return nanos(CMClockGetTime(CMClockGetHostTimeClock())); }
 
 std::string message(NSError* error, const char* fallback) {
     return error ? std::string(error.localizedDescription.UTF8String ?: fallback) : std::string(fallback);
@@ -479,6 +486,8 @@ public:
             finished_.store(false);
             stop_requested_.store(false);
             host_origin_ = CMClockGetTime(CMClockGetHostTimeClock());
+            origin_ = nanos(host_origin_);
+            timeline_.reset(origin_);
             begin_ = std::chrono::steady_clock::now();
             // Audio has been queueing since capture started. Drain it before drops count:
             // buffers before the origin are skipped, and any an output-latency offset moves
@@ -588,9 +597,22 @@ public:
         stats.mic_dropped = audio_[kMic].dropped.load();
         stats.mix_written = mix_written_.load();
         stats.system_audio_offset_ms = audio_[kSystem].enabled ? system_offset_ms_ : 0;
+        stats.paused = timeline_.paused();
+        stats.paused_seconds = static_cast<double>(timeline_.paused_total(now_nanos())) / kNanos;
         return stats;
     }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
+
+    Result pause() {
+        if (!recording_.load() || finished_.load()) return {"not recording"};
+        if (!timeline_.pause(now_nanos())) return {"already paused"};
+        return {};
+    }
+    Result resume() {
+        if (!recording_.load() || finished_.load()) return {"not recording"};
+        if (!timeline_.resume(now_nanos())) return {"not paused"};
+        return {};
+    }
 
 private:
     void fail(std::string text) {
@@ -762,6 +784,9 @@ private:
         // No adaptor pool: SCK's IOSurface-backed pixel buffer goes to VideoToolbox unchanged.
         adaptor_ = [AVAssetWriterInputPixelBufferAdaptor
             assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input_ sourcePixelBufferAttributes:nil];
+        // Write a movie fragment every second: a crash or power loss leaves every completed
+        // fragment playable. finishWriting consolidates them into a regular movie.
+        writer_.movieFragmentInterval = CMTimeMake(1, 1);
         if (![writer_ startWriting]) return {message(writer_.error, "video writer could not start")};
         [writer_ startSessionAtSourceTime:kCMTimeZero];
         return {};
@@ -769,10 +794,9 @@ private:
 
     // The frame on screen at the slot's instant: the newest delivered frame whose
     // timestamp is not after it. Runs on the recording thread, which owns current_.
-    CVPixelBufferRef select_frame(std::uint64_t slot) {
+    CVPixelBufferRef select_frame(std::uint64_t slot, std::int64_t due_nanos) {
         if (options_.test_pattern) return pattern_[core::test_flash(slot, options_.fps) ? 1 : 0];
-        const CMTime due = CMTimeAdd(host_origin_, CMTimeMake(static_cast<int64_t>(slot),
-                                                             static_cast<int32_t>(options_.fps)));
+        const CMTime due = CMTimeMake(due_nanos, kNanos);
         std::lock_guard lock(mutex_);
         while (!pending_.empty() &&
                (!current_.pixel || CMTimeCompare(pending_.front().pts, due) <= 0)) {
@@ -805,7 +829,9 @@ private:
 
     // Routes one buffer to its stem and the mix. Returns false, without side effects,
     // when the stem input cannot accept data yet.
-    bool process_audio(Source kind, CMSampleBufferRef sample) {
+    // Synthetic buffers are already on the recording timeline; captured ones pass through
+    // the pause timeline, which drops audio heard while paused.
+    bool process_audio(Source kind, CMSampleBufferRef sample, bool synthetic = false) {
         auto& source = audio_[kind];
         if (source.stem && !source.stem.readyForMoreMediaData) return false;
         const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
@@ -813,9 +839,15 @@ private:
             source.dropped.fetch_add(1);
             return true;
         }
-        // Host clock to recording time, plus the source's sync offset.
-        const CMTime shift = CMTimeSubtract(source.offset, host_origin_);
-        const CMTime start = CMTimeAdd(pts, shift);
+        // Host clock to recording time, plus the source's sync offset, minus paused time.
+        CMTime shift = CMTimeSubtract(source.offset, host_origin_);
+        CMTime start = CMTimeAdd(pts, shift);
+        if (!synthetic) {
+            const auto point = timeline_.to_output(nanos(CMTimeAdd(pts, source.offset)));
+            if (point.inside) return true;
+            start = CMTimeMake(point.output, kNanos);
+            shift = CMTimeSubtract(start, pts);
+        }
         bool used = false;
         if (source.stem && CMTimeCompare(start, kCMTimeZero) >= 0) {
             if (append_retimed(source.stem, sample, shift)) {
@@ -849,8 +881,8 @@ private:
         const auto system_end = mixer_.end(kSystem), mic_end = mixer_.end(kMic);
         std::int64_t target = flush ? std::max(system_end, mic_end) : std::min(system_end, mic_end);
         if (!flush && !options_.test_pattern) {
-            const CMTime now = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), host_origin_);
-            target = std::max(target, static_cast<std::int64_t>(CMTimeGetSeconds(now) * kMixRate) - kMixWaitFrames);
+            const auto now = timeline_.to_output(now_nanos()).output;
+            target = std::max(target, now * kMixRate / kNanos - kMixWaitFrames);
         }
         target = std::min(target, mixer_.emitted() + mixer_.capacity());
         while (mixer_.emitted() < target) {
@@ -909,11 +941,11 @@ private:
     bool submit_synthetic(Source kind, CMSampleBufferRef sample) {
         if (!sample) return false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-        bool done = process_audio(kind, sample);
+        bool done = process_audio(kind, sample, true);
         while (!done && !stop_requested_.load() && std::chrono::steady_clock::now() < deadline) {
             emit_mix(false);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            done = process_audio(kind, sample);
+            done = process_audio(kind, sample, true);
         }
         CFRelease(sample);
         return done;
@@ -952,11 +984,28 @@ private:
             ? static_cast<std::uint64_t>(std::llround(options_.duration_seconds * options_.fps)) : UINT64_MAX;
         const CMTimeScale scale = static_cast<CMTimeScale>(options_.fps);
         for (std::uint64_t slot = 0; slot < limit && !stop_requested_.load() && !finished_; ++slot) {
-            const auto tick = begin_ + nanoseconds(slot * 1000000000ull / options_.fps) + delay;
-            std::this_thread::sleep_until(tick);
+            const auto output = static_cast<std::int64_t>(slot) * kNanos / options_.fps;
+            std::int64_t due = 0;
+            steady_clock::time_point tick;
+            // Wait for the slot's host instant. A pause can begin while waiting; then the
+            // slot waits for resume() and lands after it, so the movie has no gap.
+            for (;;) {
+                if (stop_requested_.load() || finished_.load()) break;
+                const auto host = timeline_.to_host(output);
+                if (!host) {
+                    @autoreleasepool { pump_audio(false); }
+                    std::this_thread::sleep_for(milliseconds(5));
+                    continue;
+                }
+                due = *host;
+                tick = begin_ + nanoseconds(due - origin_) + delay;
+                const auto now = steady_clock::now();
+                if (now >= tick) break;
+                std::this_thread::sleep_until(std::min(tick, now + milliseconds(10)));
+            }
             if (stop_requested_.load() || finished_) break;
             @autoreleasepool {
-                CVPixelBufferRef frame = select_frame(slot);
+                CVPixelBufferRef frame = select_frame(slot, due);
                 // Retry the same timestamp for up to 500 ms on transient backpressure.
                 // Never hold a stream callback or create an unbounded frame queue.
                 bool appended = false;
@@ -1022,6 +1071,8 @@ private:
     CMAudioFormatDescriptionRef mic_tone_format_ = nullptr;
     std::uint64_t synthetic_samples_ = 0;
     CMTime host_origin_ = kCMTimeInvalid;
+    std::int64_t origin_ = 0;           // host_origin_ in nanoseconds.
+    core::PauseTimeline timeline_;
     std::chrono::steady_clock::time_point begin_{};
     AVAssetWriter* __strong writer_ = nil;
     AVAssetWriterInput* __strong input_ = nil;
@@ -1175,6 +1226,8 @@ Recorder::Recorder(Options options) : impl_(std::make_unique<Impl>(std::move(opt
 Recorder::~Recorder() = default;
 Result Recorder::start() { return impl_->capture.start(); }
 Result Recorder::stop() { return impl_->capture.stop(); }
+Result Recorder::pause() { return impl_->capture.pause(); }
+Result Recorder::resume() { return impl_->capture.resume(); }
 bool Recorder::running() const noexcept { return impl_->capture.running(); }
 bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
 Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }

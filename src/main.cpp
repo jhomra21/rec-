@@ -1,13 +1,18 @@
 #include "rec/rec.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
 #ifdef _WIN32
@@ -17,9 +22,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <conio.h>
 #include <io.h>
 #include <windows.h>
 #else
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -27,6 +34,95 @@ namespace {
 std::atomic_bool interrupted{false};
 
 extern "C" void on_signal(int) { interrupted.store(true); }
+
+enum class Command { toggle, pause, resume, stop };
+std::mutex commands_mutex;
+std::deque<Command> commands;
+
+void post(Command command) {
+    std::lock_guard lock(commands_mutex);
+    commands.push_back(command);
+}
+
+bool next_command(Command& command) {
+    std::lock_guard lock(commands_mutex);
+    if (commands.empty()) return false;
+    command = commands.front();
+    commands.pop_front();
+    return true;
+}
+
+bool keyboard() {
+#ifdef _WIN32
+    // _isatty is also true for NUL; only a real console delivers keys.
+    DWORD mode = 0;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+#ifndef _WIN32
+termios saved_terminal{};
+bool terminal_changed = false;
+void restore_terminal() {
+    if (terminal_changed) tcsetattr(STDIN_FILENO, TCSANOW, &saved_terminal);
+    terminal_changed = false;
+}
+#endif
+
+// Keys in a terminal: p or space toggles pause, q stops. Piped stdin takes one command per
+// line (pause, resume, toggle, stop), so scripts can drive a recording. The reader thread is
+// detached: a pending read must not keep the process alive after the movie is saved.
+void watch_input() {
+    if (keyboard()) {
+#ifndef _WIN32
+        termios raw{};
+        if (tcgetattr(STDIN_FILENO, &saved_terminal) == 0) {
+            raw = saved_terminal;
+            raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VTIME] = 0;
+            terminal_changed = tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+            std::atexit(restore_terminal);
+        }
+#endif
+        std::thread([] {
+            for (;;) {
+#ifdef _WIN32
+                const int key = _getch();
+#else
+                const int key = std::getchar();
+#endif
+                if (key == EOF) return;
+                if (key == 'p' || key == 'P' || key == ' ') post(Command::toggle);
+                else if (key == 'q' || key == 'Q') post(Command::stop);
+            }
+        }).detach();
+        return;
+    }
+    std::thread([] {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            // Some writers (.NET, PowerShell) start the stream with a UTF-8 byte-order mark.
+            if (line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
+            const auto first = line.find_first_not_of(" \t\r");
+            const auto last = line.find_last_not_of(" \t\r");
+            line = first == std::string::npos ? std::string() : line.substr(first, last - first + 1);
+            if (line == "pause") post(Command::pause);
+            else if (line == "resume") post(Command::resume);
+            else if (line == "toggle") post(Command::toggle);
+            else if (line == "stop") post(Command::stop);
+        }
+    }).detach();
+}
+
+std::string clock_text(double seconds) {
+    const auto tenths = static_cast<long long>(seconds * 10);
+    char text[32];
+    std::snprintf(text, sizeof text, "%02lld:%02lld.%lld", tenths / 600, (tenths / 10) % 60, tenths % 10);
+    return text;
+}
 
 void usage() {
     std::cout << "rec: native screen recorder for macOS and Windows\n\n"
@@ -39,11 +135,11 @@ void usage() {
                  "  --display N                    Display number from devices (default: 1)\n"
                  "  -r, --resolution SIZE          1080p, 1440p, 4k, or native\n"
                  "  -f, --fps N                    24, 25, 30, 50, 60, or 120\n"
-                 "  -t, --duration SECONDS         Recording length (0 = until Ctrl-C)\n"
+                 "  -t, --duration SECONDS         Recorded length, excluding pauses (0 = until stopped)\n"
                  "  --codec NAME                   auto, h264, hevc\n"
                  "  --bitrate MBPS                 Target megabits/second (0 = automatic)\n"
                  "  --no-cursor                    Do not record the cursor\n"
-                 "  --system-audio                 Record macOS system audio\n"
+                 "  --system-audio                 Record system audio\n"
                  "  --mic DEVICE                   Record a microphone: default, or an ID or name from devices\n"
                  "  --audio-tracks LAYOUT          both (mix + stems), mix, or stems (default: both)\n"
                  "  --system-gain DB               System audio level in the mix (-60 to 24)\n"
@@ -52,7 +148,9 @@ void usage() {
                  "  --mic-offset-ms MS             Delay the microphone (default: 0)\n"
                  "  --test-pattern                 Synthetic video that flashes once a second\n"
                  "  --test-tone                    Add a beep with each flash as system audio\n"
-                 "  --test-mic                     Add a quiet synthetic microphone\n";
+                 "  --test-mic                     Add a quiet synthetic microphone\n\n"
+                 "While recording, press p or space to pause and resume, q or Ctrl-C to stop.\n"
+                 "With stdin piped, send lines: pause, resume, toggle, stop.\n";
 }
 
 bool integer(std::string_view s, std::uint32_t& out) {
@@ -142,11 +240,10 @@ bool terminal() {
 }
 
 // One rewritten line: elapsed time and anything that needs attention.
-void show_status(const rec::Stats& stats, std::chrono::steady_clock::duration elapsed, bool audio) {
-    const auto tenths = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 100;
-    std::cout << "\r\033[31m\xE2\x97\x8F\033[0m REC " << std::setfill('0') << std::setw(2) << tenths / 600 << ':'
-              << std::setw(2) << (tenths / 10) % 60 << '.' << tenths % 10 << std::setfill(' ')
-              << "   " << stats.written << " frames";
+void show_status(const rec::Stats& stats, double recorded, bool audio) {
+    if (stats.paused) std::cout << "\r\033[33m\xE2\x9D\x9A\xE2\x9D\x9A PAUSED\033[0m ";
+    else std::cout << "\r\033[31m\xE2\x97\x8F\033[0m REC    ";
+    std::cout << clock_text(recorded) << "   " << stats.written << " frames";
     if (stats.dropped) std::cout << ", \033[33m" << stats.dropped << " dropped\033[0m";
     if (audio && stats.audio_dropped + stats.mic_dropped)
         std::cout << ", \033[33maudio drops " << stats.audio_dropped + stats.mic_dropped << "\033[0m";
@@ -216,18 +313,39 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     const bool audio = options.system_audio || options.microphone || options.test_tone || options.test_mic;
     const bool live = terminal();
-    std::cout << "Recording to " << options.output << " (Ctrl-C to stop)\n";
+    std::cout << "Recording to " << options.output
+              << (keyboard() ? " (p: pause/resume, q or Ctrl-C: stop)\n" : " (Ctrl-C to stop)\n") << std::flush;
+    watch_input();
     const auto began = std::chrono::steady_clock::now();
     auto shown = began - std::chrono::seconds(1);
+    auto recorded = [&] {
+        const std::chrono::duration<double> wall = std::chrono::steady_clock::now() - began;
+        return std::max(0.0, wall.count() - recorder.stats().paused_seconds);
+    };
     while (!interrupted.load() && !recorder.finished()) {
+        Command command;
+        while (next_command(command)) {
+            if (command == Command::stop) { interrupted.store(true); break; }
+            const bool pause = command == Command::pause ||
+                (command == Command::toggle && !recorder.stats().paused);
+            const auto changed = pause ? recorder.pause() : recorder.resume();
+            if (live) std::cout << "\r\033[K";
+            if (changed) std::cout << (pause ? "Paused at " : "Resumed at ") << clock_text(recorded()) << '\n';
+            else std::cerr << changed.error << '\n';
+            std::cout << std::flush;
+            shown -= std::chrono::seconds(1);
+        }
         const auto now = std::chrono::steady_clock::now();
         if (live && now - shown >= std::chrono::milliseconds(250)) {
-            show_status(recorder.stats(), now - began, audio);
+            show_status(recorder.stats(), recorded(), audio);
             shown = now;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (live) std::cout << "\r\033[KFinishing...\n" << std::flush;
+#ifndef _WIN32
+    restore_terminal();
+#endif
     const auto stopped = recorder.stop();
     const auto stats = recorder.stats();
     std::cout << "Captured " << stats.captured << ", written " << stats.written
@@ -238,6 +356,8 @@ int main(int argc, char** argv) {
     if (options.microphone || options.test_mic)
         std::cout << "Microphone buffers written " << stats.mic_written << ", dropped " << stats.mic_dropped << '\n';
     if (stats.mix_written) std::cout << "Mix buffers written " << stats.mix_written << '\n';
+    if (stats.paused_seconds > 0)
+        std::cout << "Paused " << std::fixed << std::setprecision(1) << stats.paused_seconds << " s (not in the movie)\n";
     if (!stopped) { std::cerr << stopped.error << '\n'; return 1; }
     if (!recorder.failure().empty()) { std::cerr << recorder.failure() << '\n'; return 1; }
     std::cout << "Saved " << options.output << '\n';
