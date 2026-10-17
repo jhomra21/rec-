@@ -26,6 +26,7 @@ Build a compact recorder for macOS (primary) and Windows. Keep the recording eng
 Use these projects to understand patterns and tradeoffs, not as templates to copy.
 
 - `michaelshimeles/rec-rs`: ScreenCaptureKit frame handling, timing, AVAssetWriter output, A/V synchronization, replay and streaming requirements. Study its tests and `PERFORMANCE.md` before changing output semantics.
+- `R44VC0RP/isocast` (Isocast): native macOS recorder in Rust. Study its OBS-style scenes and sources, per-source ISO recordings beside the program output, RTMP/RTMPS streaming, the camera extension, and the background engine daemon (`isocastd`) that the app, CLI, MCP and plugins all drive through one API. Use it for scene, ISO and headless-capture design. It is MIT/Apache-2.0 licensed; still record the upstream revision when copying behavior.
 - `obsproject/obs-studio`: separation of capture sources and outputs, texture lifetime, device changes, bounded queues, and encoder backpressure. Follow the architecture, not the plugin surface or GPL source code.
 - `jhomra21/daw-browser-convex`: native C++ ownership, realtime callback discipline, and isolation of runtime from UI.
 - `jhomra21/bgcut`: object-oriented public APIs, dependency direction, no speculative package splitting, and observable E2E acceptance.
