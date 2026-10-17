@@ -480,6 +480,10 @@ public:
             stop_requested_.store(false);
             host_origin_ = CMClockGetTime(CMClockGetHostTimeClock());
             begin_ = std::chrono::steady_clock::now();
+            // Audio has been queueing since capture started. Drain it before drops count:
+            // buffers before the origin are skipped, and any an output-latency offset moves
+            // past it are kept. Otherwise the full ring evicts pre-roll until the first slot.
+            pump_audio(false);
             recording_.store(true);
             pacer_ = std::thread([this] { run(); });
             return {};
