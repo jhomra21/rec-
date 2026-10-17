@@ -1,5 +1,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -12,8 +13,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -21,7 +25,7 @@
 
 namespace rec {
 void receive_frame(void* owner, CMSampleBufferRef sample);
-void receive_audio(void* owner, CMSampleBufferRef sample);
+void receive_audio(void* owner, CMSampleBufferRef sample, bool microphone);
 void receive_failure(void* owner, NSError* error);
 }
 
@@ -34,8 +38,13 @@ void receive_failure(void* owner, NSError* error);
        ofType:(SCStreamOutputType)type {
     (void)stream;
     if (!self.owner) return;
-    if (type == SCStreamOutputTypeScreen) rec::receive_frame(self.owner, buffer);
-    else if (type == SCStreamOutputTypeAudio) rec::receive_audio(self.owner, buffer);
+    if (type == SCStreamOutputTypeScreen) {
+        rec::receive_frame(self.owner, buffer);
+    } else if (type == SCStreamOutputTypeAudio) {
+        rec::receive_audio(self.owner, buffer, false);
+    } else if (@available(macOS 15.0, *)) {
+        if (type == SCStreamOutputTypeMicrophone) rec::receive_audio(self.owner, buffer, true);
+    }
 }
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
     (void)stream;
@@ -45,6 +54,15 @@ void receive_failure(void* owner, NSError* error);
 
 namespace rec {
 namespace {
+constexpr std::int32_t kMixRate = 48000;
+constexpr double kTwoPi = 6.283185307179586;
+// Video is emitted this far behind real time, so the frame that was on screen at each
+// slot instant has already been delivered. ScreenCaptureKit delivers frames a few
+// milliseconds after their presentation timestamps.
+constexpr auto kEmitDelay = std::chrono::milliseconds(40);
+// A stalled source holds the mix back at most this long; it is then filled with silence.
+constexpr std::int64_t kMixWaitFrames = kMixRate * 3 / 10;
+
 std::string message(NSError* error, const char* fallback) {
     return error ? std::string(error.localizedDescription.UTF8String ?: fallback) : std::string(fallback);
 }
@@ -68,7 +86,7 @@ SCShareableContent* shareable(std::string& error) {
 
 struct Size { std::uint32_t width, height; };
 
-Size output_size(Options options, SCDisplay* display) {
+Size output_size(const Options& options, SCDisplay* display) {
     auto mode = CGDisplayCopyDisplayMode(display.displayID);
     const std::uint32_t native_w = mode ? static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode)) : display.width;
     const std::uint32_t native_h = mode ? static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode)) : display.height;
@@ -93,6 +111,348 @@ Result wait_capture(SCStream* stream, bool start) {
         return {start ? "screen capture start timed out" : "screen capture stop timed out"};
     return reported ? Result{message(reported, "screen capture failed")} : Result{};
 }
+
+template <class T>
+bool audio_property(AudioObjectID object, AudioObjectPropertySelector selector,
+                    AudioObjectPropertyScope scope, T& value) {
+    AudioObjectPropertyAddress address{selector, scope, kAudioObjectPropertyElementMain};
+    UInt32 size = sizeof(T);
+    return AudioObjectGetPropertyData(object, &address, 0, nullptr, &size, &value) == noErr;
+}
+
+// ScreenCaptureKit captures system audio when it is mixed, one output latency before it is heard.
+double output_latency_seconds() {
+    AudioDeviceID device = kAudioObjectUnknown;
+    if (!audio_property(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+                        kAudioObjectPropertyScopeGlobal, device) || device == kAudioObjectUnknown)
+        return 0;
+    Float64 rate = 0;
+    if (!audio_property(device, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, rate) ||
+        rate <= 0)
+        return 0;
+    UInt32 latency = 0, safety = 0, buffer = 0, stream_latency = 0;
+    audio_property(device, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, latency);
+    audio_property(device, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, safety);
+    audio_property(device, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, buffer);
+    AudioObjectPropertyAddress streams{kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput,
+                                       kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &streams, 0, nullptr, &size) == noErr &&
+        size >= sizeof(AudioStreamID)) {
+        std::vector<AudioStreamID> ids(size / sizeof(AudioStreamID));
+        if (AudioObjectGetPropertyData(device, &streams, 0, nullptr, &size, ids.data()) == noErr && !ids.empty())
+            audio_property(ids[0], kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, stream_latency);
+    }
+    const double seconds = (static_cast<double>(latency) + safety + buffer + stream_latency) / rate;
+    return std::clamp(seconds, 0.0, 0.5);
+}
+
+NSArray<AVCaptureDevice*>* microphones() {
+    if (@available(macOS 14.0, *)) {
+        return [AVCaptureDeviceDiscoverySession
+            discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeMicrophone]
+                                  mediaType:AVMediaTypeAudio
+                                   position:AVCaptureDevicePositionUnspecified].devices;
+    }
+    return @[];
+}
+
+AVCaptureDevice* find_microphone(const std::string& query, std::string& error) {
+    if (query.empty() || query == "default") {
+        AVCaptureDevice* device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        if (!device) error = "no microphone found";
+        return device;
+    }
+    NSString* needle = [NSString stringWithUTF8String:query.c_str()];
+    if (!needle) { error = "invalid microphone name"; return nil; }
+    NSArray<AVCaptureDevice*>* devices = microphones();
+    for (AVCaptureDevice* device in devices)
+        if ([device.uniqueID isEqualToString:needle]) return device;
+    for (AVCaptureDevice* device in devices)
+        if ([device.localizedName rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return device;
+    error = "microphone not found: " + query + " (run `rec devices`)";
+    return nil;
+}
+
+Result microphone_access() {
+    const auto status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (status == AVAuthorizationStatusAuthorized) return {};
+    if (status == AVAuthorizationStatusNotDetermined) {
+        __block BOOL granted = NO;
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL allowed) {
+            granted = allowed;
+            dispatch_semaphore_signal(done);
+        }];
+        if (!dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC)) && granted)
+            return {};
+    }
+    return {"microphone access denied. Allow it in System Settings > Privacy & Security > Microphone, then retry."};
+}
+
+CMAudioFormatDescriptionRef pcm_format(std::uint32_t channels, bool is_float) {
+    AudioStreamBasicDescription format{};
+    format.mSampleRate = kMixRate;
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = (is_float ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) |
+                          kAudioFormatFlagIsPacked;
+    format.mBitsPerChannel = is_float ? 32 : 16;
+    format.mChannelsPerFrame = channels;
+    format.mBytesPerFrame = channels * format.mBitsPerChannel / 8;
+    format.mFramesPerPacket = 1;
+    format.mBytesPerPacket = format.mBytesPerFrame;
+    CMAudioFormatDescriptionRef description = nullptr;
+    if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &format, 0, nullptr, 0, nullptr, nullptr,
+                                       &description) != noErr)
+        return nullptr;
+    return description;
+}
+
+// Interleaved PCM in format at a 48 kHz timestamp. The caller releases the result.
+CMSampleBufferRef pcm_buffer(CMAudioFormatDescriptionRef format, const void* data, std::size_t bytes,
+                             std::size_t frames, CMTime pts) {
+    if (!format || !frames) return nullptr;
+    CMBlockBufferRef block = nullptr;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes, kCFAllocatorDefault,
+                                           nullptr, 0, bytes, 0, &block) != kCMBlockBufferNoErr)
+        return nullptr;
+    if (CMBlockBufferReplaceDataBytes(data, block, 0, bytes) != kCMBlockBufferNoErr) {
+        CFRelease(block);
+        return nullptr;
+    }
+    CMSampleTimingInfo timing{CMTimeMake(1, kMixRate), pts, kCMTimeInvalid};
+    CMSampleBufferRef sample = nullptr;
+    const auto status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, format,
+                                                  static_cast<CMItemCount>(frames), 1, &timing, 0,
+                                                  nullptr, &sample);
+    CFRelease(block);
+    return status == noErr ? sample : nullptr;
+}
+
+// Reads 16/32-bit integer or 32-bit float PCM, interleaved or planar, as interleaved
+// stereo float at 48 kHz. Mono is duplicated; channels after the second are ignored.
+bool stereo_pcm(CMSampleBufferRef sample, std::vector<float>& out, std::vector<std::byte>& scratch) {
+    out.clear();
+    const auto* format = CMAudioFormatDescriptionGetStreamBasicDescription(CMSampleBufferGetFormatDescription(sample));
+    if (!format || format->mFormatID != kAudioFormatLinearPCM || format->mSampleRate <= 0 ||
+        format->mChannelsPerFrame == 0 || (format->mFormatFlags & kAudioFormatFlagIsBigEndian))
+        return false;
+    const bool is_float = format->mFormatFlags & kAudioFormatFlagIsFloat;
+    const auto bits = format->mBitsPerChannel;
+    if (!(is_float ? bits == 32 : (bits == 16 || bits == 32))) return false;
+    const auto frames = static_cast<std::size_t>(CMSampleBufferGetNumSamples(sample));
+    if (!frames) return true;
+
+    const auto flags = kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment;
+    std::size_t list_size = 0;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, &list_size, nullptr, 0, nullptr,
+                                                                nullptr, flags, nullptr) != noErr)
+        return false;
+    scratch.resize(list_size);
+    auto* list = reinterpret_cast<AudioBufferList*>(scratch.data());
+    CMBlockBufferRef block = nullptr;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, nullptr, list, list_size, nullptr,
+                                                                nullptr, flags, &block) != noErr)
+        return false;
+    const bool planar = format->mFormatFlags & kAudioFormatFlagIsNonInterleaved;
+    const UInt32 channels = format->mChannelsPerFrame;
+    const std::size_t needed = frames * (bits / 8) * (planar ? 1 : channels);
+    bool readable = list->mNumberBuffers > 0;
+    for (UInt32 i = 0; readable && i < list->mNumberBuffers; ++i)
+        readable = list->mBuffers[i].mData && list->mBuffers[i].mDataByteSize >= needed;
+    if (!readable) {
+        if (block) CFRelease(block);
+        return false;
+    }
+    auto read = [&](UInt32 channel, std::size_t frame) -> float {
+        channel = std::min(channel, channels - 1);
+        const AudioBuffer& buffer = list->mBuffers[planar ? std::min(channel, list->mNumberBuffers - 1) : 0];
+        const std::size_t index = planar ? frame : frame * channels + channel;
+        if (is_float) return static_cast<const float*>(buffer.mData)[index];
+        if (bits == 16) return static_cast<const std::int16_t*>(buffer.mData)[index] / 32768.0f;
+        return static_cast<const std::int32_t*>(buffer.mData)[index] / 2147483648.0f;
+    };
+    const double ratio = format->mSampleRate / kMixRate;
+    if (ratio == 1.0) {
+        out.resize(frames * 2);
+        for (std::size_t i = 0; i < frames; ++i) {
+            out[i * 2] = read(0, i);
+            out[i * 2 + 1] = read(1, i);
+        }
+    } else {
+        // Linear, per buffer. The microphone stem is converted by AVFoundation instead.
+        const auto converted = static_cast<std::size_t>(std::llround(frames / ratio));
+        out.resize(converted * 2);
+        for (std::size_t i = 0; i < converted; ++i) {
+            const double position = i * ratio;
+            const auto first = std::min(static_cast<std::size_t>(position), frames - 1);
+            const auto second = std::min(first + 1, frames - 1);
+            const auto t = static_cast<float>(position - static_cast<double>(first));
+            for (UInt32 c = 0; c < 2; ++c) {
+                const float a = read(c, first);
+                out[i * 2 + c] = a + (read(c, second) - a) * t;
+            }
+        }
+    }
+    if (block) CFRelease(block);
+    return true;
+}
+
+CVPixelBufferRef pattern_frame(Size size, bool flash) {
+    CVPixelBufferRef pixel = nullptr;
+    NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    if (CVPixelBufferCreate(kCFAllocatorDefault, size.width, size.height,
+                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                            (__bridge CFDictionaryRef)attributes, &pixel) != kCVReturnSuccess)
+        return nullptr;
+    CVPixelBufferLockBaseAddress(pixel, 0);
+    auto* y = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 0));
+    const auto y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
+    for (std::size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 0); ++row)
+        std::memset(y + row * y_stride, flash ? 235 : (row % 24 < 12 ? 120 : 40),
+                    CVPixelBufferGetWidthOfPlane(pixel, 0));
+    auto* uv = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 1));
+    const auto uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
+    for (std::size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 1); ++row)
+        std::memset(uv + row * uv_stride, 128, CVPixelBufferGetWidthOfPlane(pixel, 1) * 2);
+    CVPixelBufferUnlockBaseAddress(pixel, 0);
+    return pixel;
+}
+
+// Fixed-capacity FIFO of retained sample buffers. Overflow releases the oldest.
+class PacketRing {
+public:
+    ~PacketRing() { clear(); }
+    // Takes ownership. Returns false when the oldest packet was dropped to make room.
+    bool push(CMSampleBufferRef sample) {
+        bool kept = true;
+        if (count_ == items_.size()) {
+            CFRelease(pop());
+            kept = false;
+        }
+        items_[(head_ + count_) % items_.size()] = sample;
+        ++count_;
+        return kept;
+    }
+    CMSampleBufferRef pop() {
+        if (!count_) return nullptr;
+        auto* sample = items_[head_];
+        items_[head_] = nullptr;
+        head_ = (head_ + 1) % items_.size();
+        --count_;
+        return sample;
+    }
+    void clear() {
+        while (auto* sample = pop()) CFRelease(sample);
+    }
+
+private:
+    std::array<CMSampleBufferRef, 16> items_{};
+    std::size_t head_ = 0;
+    std::size_t count_ = 0;
+};
+
+struct Frame {
+    CVPixelBufferRef pixel = nullptr;
+    CMTime pts = kCMTimeInvalid;
+};
+
+// Frames delivered but not yet due. Overflow releases the oldest, which a newer frame supersedes.
+class FrameRing {
+public:
+    ~FrameRing() { clear(); }
+    void push(Frame frame) {
+        if (count_ == items_.size()) CVPixelBufferRelease(pop().pixel);
+        items_[(head_ + count_) % items_.size()] = frame;
+        ++count_;
+    }
+    bool empty() const { return count_ == 0; }
+    const Frame& front() const { return items_[head_]; }
+    Frame pop() {
+        Frame frame = items_[head_];
+        items_[head_] = {};
+        head_ = (head_ + 1) % items_.size();
+        --count_;
+        return frame;
+    }
+    void clear() {
+        while (count_) CVPixelBufferRelease(pop().pixel);
+    }
+
+private:
+    std::array<Frame, 3> items_{};
+    std::size_t head_ = 0;
+    std::size_t count_ = 0;
+};
+
+// Sums sources on a 48 kHz timeline whose sample 0 is the recording origin, then
+// limits the result below -1 dBFS instead of clipping. Not thread-safe; the recording
+// thread owns it.
+class Mixer {
+public:
+    void reset(std::size_t capacity) {
+        buffer_.assign(capacity * 2, 0.0f);
+        capacity_ = static_cast<std::int64_t>(capacity);
+        emitted_ = 0;
+        ends_ = {0, 0};
+        gain_ = 1;
+    }
+    std::int64_t emitted() const { return emitted_; }
+    std::int64_t capacity() const { return capacity_; }
+    std::int64_t end(std::size_t source) const { return ends_[source]; }
+
+    // Frames before the emitted point or beyond the window are discarded.
+    void add(std::size_t source, std::int64_t start, const float* stereo, std::size_t frames, float gain) {
+        const auto stop = start + static_cast<std::int64_t>(frames);
+        ends_[source] = std::max(ends_[source], stop);
+        const auto first = std::max(start, emitted_);
+        const auto last = std::min(stop, emitted_ + capacity_);
+        for (auto i = first; i < last; ++i) {
+            const auto slot = static_cast<std::size_t>(i % capacity_) * 2;
+            const auto from = static_cast<std::size_t>(i - start) * 2;
+            buffer_[slot] += stereo[from] * gain;
+            buffer_[slot + 1] += stereo[from + 1] * gain;
+        }
+    }
+
+    void take(std::size_t frames, std::vector<float>& out) {
+        out.resize(frames * 2);
+        for (std::size_t i = 0; i < frames; ++i) {
+            const auto slot = static_cast<std::size_t>((emitted_ + static_cast<std::int64_t>(i)) % capacity_) * 2;
+            const float left = buffer_[slot], right = buffer_[slot + 1];
+            const float peak = std::max(std::fabs(left), std::fabs(right));
+            const float needed = peak > kCeiling ? kCeiling / peak : 1.0f;
+            gain_ = needed < gain_ ? needed : std::min(needed, gain_ + (1.0f - gain_) * kRelease);
+            out[i * 2] = left * gain_;
+            out[i * 2 + 1] = right * gain_;
+            buffer_[slot] = buffer_[slot + 1] = 0;
+        }
+        emitted_ += static_cast<std::int64_t>(frames);
+    }
+
+private:
+    static constexpr float kCeiling = 0.891f;  // -1 dBFS
+    static constexpr float kRelease = 1.0f / (0.05f * kMixRate);  // About 50 ms back to unity.
+    std::vector<float> buffer_;
+    std::int64_t capacity_ = 1;
+    std::int64_t emitted_ = 0;
+    std::array<std::int64_t, 2> ends_{};
+    float gain_ = 1;
+};
+
+enum Source : std::size_t { kSystem = 0, kMic = 1 };
+
+struct AudioSource {
+    bool enabled = false;
+    PacketRing queue;                    // Filled by the capture callback; guarded by CaptureState::mutex_.
+    CMSampleBufferRef held = nullptr;    // Dequeued, waiting for its writer input to accept it.
+    AVAssetWriterInput* __strong stem = nil;
+    CMTime offset = kCMTimeZero;
+    float gain = 1;
+    std::int64_t next_mix = INT64_MIN;   // Keeps consecutive buffers contiguous in the mix.
+    std::atomic<std::uint64_t> written{0}, dropped{0};
+};
 } // namespace
 
 std::vector<Display> list_displays(std::string& error) {
@@ -110,7 +470,20 @@ std::vector<Display> list_displays(std::string& error) {
     }
 }
 
-// One retained surface and one encoding thread. The SCK callback never waits for the encoder.
+std::vector<AudioDevice> list_microphones(std::string& error) {
+    @autoreleasepool {
+        error.clear();
+        std::vector<AudioDevice> result;
+        for (AVCaptureDevice* device in microphones())
+            result.push_back({device.uniqueID.UTF8String ?: "", device.localizedName.UTF8String ?: ""});
+        return result;
+    }
+}
+
+double default_output_latency_ms() noexcept { return output_latency_seconds() * 1000.0; }
+
+// Capture callbacks only retain and enqueue. One recording thread encodes video on a
+// constant-frame-rate grid, routes audio to stems and the mix, and never blocks a callback.
 class CaptureState {
 public:
     explicit CaptureState(Options options) : options_(std::move(options)) {}
@@ -120,101 +493,36 @@ public:
         @autoreleasepool {
             if (active_) return {"already recording"};
             if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
-            if (options_.test_tone && !options_.test_pattern) return {"test tone needs test pattern"};
-            if (options_.system_audio && options_.test_pattern) return {"system audio requires a screen"};
-            std::string error;
+            if ((options_.test_tone || options_.test_mic) && !options_.test_pattern)
+                return {"synthetic audio needs the test pattern"};
+            if ((options_.system_audio || options_.microphone) && options_.test_pattern)
+                return {"system audio and microphone need a real screen capture"};
             if (options_.output.empty()) return {"output path is empty"};
             NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
             if (!path) return {"invalid output path"};
             if ([[NSFileManager defaultManager] fileExistsAtPath:path])
                 return {"output file already exists: " + options_.output};
+
+            audio_[kSystem].enabled = options_.system_audio || options_.test_tone;
+            audio_[kMic].enabled = options_.microphone || options_.test_mic;
+            system_offset_ms_ = options_.system_audio_offset_ms.value_or(
+                options_.test_pattern ? 0.0 : output_latency_seconds() * 1000.0);
+            audio_[kSystem].offset = CMTimeMakeWithSeconds(system_offset_ms_ / 1000.0, kMixRate);
+            audio_[kMic].offset = CMTimeMakeWithSeconds(options_.mic_offset_ms / 1000.0, kMixRate);
+            audio_[kSystem].gain = static_cast<float>(std::pow(10.0, options_.system_gain_db / 20.0));
+            audio_[kMic].gain = static_cast<float>(std::pow(10.0, options_.mic_gain_db / 20.0));
+
             if (!options_.test_pattern) {
-            SCShareableContent* content = shareable(error);
-            if (!content) return {error};
-            if (options_.display > content.displays.count) return {"display index not found; run `rec devices`"};
-            SCDisplay* display = content.displays[options_.display - 1];
-            size_ = output_size(options_, display);
-            if (!size_.width || !size_.height) return {"display has no usable pixel dimensions"};
-            SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
-            SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
-            config.width = size_.width;
-            config.height = size_.height;
-            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-            config.minimumFrameInterval = CMTimeMake(9, static_cast<int32_t>(options_.fps * 10));
-            config.queueDepth = 3;
-            config.showsCursor = options_.cursor;
-            config.capturesAudio = options_.system_audio;
-            config.sampleRate = 48000;
-            config.channelCount = 2;
-            config.excludesCurrentProcessAudio = YES;
-            config.scalesToFit = YES;
-            config.preservesAspectRatio = YES;
-            receiver_ = [[RecCaptureOutput alloc] init];
-            receiver_.owner = this;
-            queue_ = dispatch_queue_create("rec.capture.frames", DISPATCH_QUEUE_SERIAL);
-            if (options_.system_audio)
-                audio_dispatch_queue_ = dispatch_queue_create("rec.capture.audio", DISPATCH_QUEUE_SERIAL);
-            stream_ = [[SCStream alloc] initWithFilter:filter configuration:config delegate:receiver_];
-            NSError* streamError = nil;
-            if (![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeScreen
-                      sampleHandlerQueue:queue_ error:&streamError]) {
-                error = message(streamError, "could not subscribe to screen frames");
-                cleanup_capture();
-                return {error};
-            }
-            if (options_.system_audio &&
-                ![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeAudio
-                      sampleHandlerQueue:audio_dispatch_queue_ error:&streamError]) {
-                error = message(streamError, "could not subscribe to system audio");
-                cleanup_capture();
-                return {error};
-            }
-            auto started = wait_capture(stream_, true);
-            if (!started) { cleanup_capture(); return started; }
-            active_ = true;
-            {
-                std::unique_lock lock(mutex_);
-                if (!frames_ready_.wait_for(lock, std::chrono::seconds(8), [this] {
-                    return newest_ != nullptr || !failure_.empty();
-                })) {
-                    error = "no screen frames arrived within 8 seconds (check Screen Recording permission)";
-                } else if (!failure_.empty()) {
-                    error = failure_;
-                }
-            }
-            if (!error.empty()) { stop(); return {error}; }
+                if (auto started = start_capture(); !started) return started;
             } else {
                 // Exercise the real VideoToolbox writer without TCC, display or compositor.
-                size_ = {options_.width ? options_.width : 1920u,
-                         options_.height ? options_.height : 1080u};
-                size_.width &= ~1u;
-                size_.height &= ~1u;
+                size_ = {(options_.width ? options_.width : 1920u) & ~1u,
+                         (options_.height ? options_.height : 1080u) & ~1u};
                 if (size_.width < 2 || size_.height < 2) return {"invalid synthetic frame dimensions"};
-                CVPixelBufferRef pixel = nullptr;
-                NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-                const CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault,
-                    size_.width, size_.height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    (__bridge CFDictionaryRef)attributes, &pixel);
-                if (result != kCVReturnSuccess || !pixel) return {"synthetic frame allocation failed"};
-                CVPixelBufferLockBaseAddress(pixel, 0);
-                for (size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 0); ++row) {
-                    auto* y = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 0));
-                    const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
-                    std::memset(y + row * stride, row % 24 < 12 ? 175 : 65,
-                                CVPixelBufferGetWidthOfPlane(pixel, 0));
-                }
-                for (size_t row = 0; row < CVPixelBufferGetHeightOfPlane(pixel, 1); ++row) {
-                    auto* uv = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 1));
-                    const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
-                    std::memset(uv + row * stride, 128,
-                                CVPixelBufferGetWidthOfPlane(pixel, 1) * 2);
-                }
-                CVPixelBufferUnlockBaseAddress(pixel, 0);
-                {
-                    std::lock_guard lock(mutex_);
-                    newest_ = pixel;
-                    captured_.store(1);
-                }
+                pattern_[0] = pattern_frame(size_, false);
+                pattern_[1] = pattern_frame(size_, true);
+                if (!pattern_[0] || !pattern_[1]) { stop(); return {"synthetic frame allocation failed"}; }
+                captured_.store(1);
                 active_.store(true);
             }
             auto ready = create_writer();
@@ -225,6 +533,8 @@ public:
             finished_.store(false);
             stop_requested_.store(false);
             host_origin_ = CMClockGetTime(CMClockGetHostTimeClock());
+            begin_ = std::chrono::steady_clock::now();
+            recording_.store(true);
             pacer_ = std::thread([this] { run(); });
             return {};
         }
@@ -238,42 +548,44 @@ public:
                 if (active_) result = wait_capture(stream_, false);
                 // Drain callbacks before clearing their unowned C++ pointer.
                 if (queue_) dispatch_sync(queue_, ^{});
-                if (audio_dispatch_queue_) dispatch_sync(audio_dispatch_queue_, ^{});
+                if (audio_queue_) dispatch_sync(audio_queue_, ^{});
                 cleanup_capture();
             }
-            // Append audio delivered just before SCK stopped, before closing the AAC input.
-            if (options_.system_audio && writer_ &&
-                writer_.status == AVAssetWriterStatusWriting) write_system_audio();
             if (writer_) {
                 if (writer_.status == AVAssetWriterStatusWriting) {
+                    // Append audio delivered just before capture stopped, then close the mix.
+                    pump_audio(true);
                     [input_ markAsFinished];
-                    if (audio_input_) [audio_input_ markAsFinished];
+                    if (mix_input_) [mix_input_ markAsFinished];
+                    for (auto& source : audio_)
+                        if (source.stem) [source.stem markAsFinished];
                     dispatch_semaphore_t done = dispatch_semaphore_create(0);
                     [writer_ finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
                     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)))
                         result = {"timed out finalizing the recording"};
                 }
                 if (writer_.status == AVAssetWriterStatusFailed)
-                    result = {message(writer_.error, "video writer failed")};
+                    result = {message(writer_.error, "recording writer failed")};
                 adaptor_ = nil;
-                audio_input_ = nil;
+                mix_input_ = nil;
+                for (auto& source : audio_) source.stem = nil;
                 input_ = nil;
                 writer_ = nil;
             }
             if (activity_) { [[NSProcessInfo processInfo] endActivity:activity_]; activity_ = nil; }
+            recording_.store(false);
             {
                 std::lock_guard lock(mutex_);
-                while (audio_count_) {
-                    CFRelease(audio_packets_[audio_head_]);
-                    audio_packets_[audio_head_] = nullptr;
-                    audio_head_ = (audio_head_ + 1) % audio_packets_.size();
-                    --audio_count_;
-                }
+                pending_.clear();
+                for (auto& source : audio_) source.queue.clear();
             }
-            {
-                std::lock_guard lock(mutex_);
-                if (newest_) { CVPixelBufferRelease(newest_); newest_ = nullptr; }
-            }
+            for (auto& source : audio_)
+                if (source.held) { CFRelease(source.held); source.held = nullptr; }
+            if (current_.pixel) { CVPixelBufferRelease(current_.pixel); current_ = {}; }
+            for (auto& pixel : pattern_)
+                if (pixel) { CVPixelBufferRelease(pixel); pixel = nullptr; }
+            for (auto* format : {&mix_format_, &tone_format_, &mic_tone_format_})
+                if (*format) { CFRelease(*format); *format = nullptr; }
             active_ = false;
             return result;
         }
@@ -292,47 +604,152 @@ public:
         CVPixelBufferRetain(pixel);
         {
             std::lock_guard lock(mutex_);
-            auto* old = newest_;
-            newest_ = pixel;
-            if (old) CVPixelBufferRelease(old);
+            pending_.push({pixel, CMSampleBufferGetPresentationTimeStamp(sample)});
             captured_.fetch_add(1, std::memory_order_relaxed);
         }
         frames_ready_.notify_one();
     }
 
-    void on_audio(CMSampleBufferRef sample) {
-        if (!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) return;
+    void on_audio(CMSampleBufferRef sample, bool microphone) {
+        auto& source = audio_[microphone ? kMic : kSystem];
+        if (!source.enabled || !CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) return;
         CFRetain(sample);
         std::lock_guard lock(mutex_);
-        if (audio_count_ == audio_packets_.size()) {
-            CFRelease(audio_packets_[audio_head_]);
-            audio_packets_[audio_head_] = nullptr;
-            audio_head_ = (audio_head_ + 1) % audio_packets_.size();
-            --audio_count_;
-            audio_dropped_.fetch_add(1, std::memory_order_relaxed);
-        }
-        audio_packets_[(audio_head_ + audio_count_) % audio_packets_.size()] = sample;
-        ++audio_count_;
+        // Before the origin, overflow only discards pre-roll that would never be written.
+        if (!source.queue.push(sample) && recording_.load(std::memory_order_relaxed))
+            source.dropped.fetch_add(1, std::memory_order_relaxed);
     }
 
     void on_failure(NSError* error) {
-        {
-            std::lock_guard lock(mutex_);
-            failure_ = message(error, "screen capture stopped unexpectedly");
-        }
-        finished_.store(true);
+        fail(message(error, "screen capture stopped unexpectedly"));
         frames_ready_.notify_one();
     }
 
     bool running() const noexcept { return active_ && !finished_.load(); }
     bool finished() const noexcept { return finished_.load(); }
     Stats stats() const noexcept {
-        return {captured_.load(), written_.load(), dropped_.load(),
-                audio_written_.load(), audio_dropped_.load()};
+        Stats stats;
+        stats.captured = captured_.load();
+        stats.written = written_.load();
+        stats.dropped = dropped_.load();
+        stats.audio_written = audio_[kSystem].written.load();
+        stats.audio_dropped = audio_[kSystem].dropped.load();
+        stats.mic_written = audio_[kMic].written.load();
+        stats.mic_dropped = audio_[kMic].dropped.load();
+        stats.mix_written = mix_written_.load();
+        stats.system_audio_offset_ms = audio_[kSystem].enabled ? system_offset_ms_ : 0;
+        return stats;
     }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
 
 private:
+    void fail(std::string text) {
+        {
+            std::lock_guard lock(mutex_);
+            if (failure_.empty()) failure_ = std::move(text);
+        }
+        finished_.store(true);
+    }
+
+    Result start_capture() {
+        std::string error;
+        NSString* microphone_id = nil;
+        if (options_.microphone) {
+            if (@available(macOS 15.0, *)) {
+            } else {
+                return {"microphone capture requires macOS 15 or newer"};
+            }
+            AVCaptureDevice* device = find_microphone(options_.microphone_device, error);
+            if (!device) return {error};
+            if (auto access = microphone_access(); !access) return access;
+            microphone_id = device.uniqueID;
+        }
+        SCShareableContent* content = shareable(error);
+        if (!content) return {error};
+        if (options_.display > content.displays.count) return {"display index not found; run `rec devices`"};
+        SCDisplay* display = content.displays[options_.display - 1];
+        size_ = output_size(options_, display);
+        if (!size_.width || !size_.height) return {"display has no usable pixel dimensions"};
+        SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
+        config.width = size_.width;
+        config.height = size_.height;
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        config.minimumFrameInterval = CMTimeMake(9, static_cast<int32_t>(options_.fps * 10));
+        // Up to three pending frames plus the current one and the encoder's in-flight surfaces.
+        config.queueDepth = 6;
+        config.showsCursor = options_.cursor;
+        config.capturesAudio = options_.system_audio;
+        config.sampleRate = kMixRate;
+        config.channelCount = 2;
+        config.excludesCurrentProcessAudio = YES;
+        config.scalesToFit = YES;
+        config.preservesAspectRatio = YES;
+        if (options_.microphone) {
+            if (@available(macOS 15.0, *)) {
+                config.captureMicrophone = YES;
+                config.microphoneCaptureDeviceID = microphone_id;
+            }
+        }
+        receiver_ = [[RecCaptureOutput alloc] init];
+        receiver_.owner = this;
+        queue_ = dispatch_queue_create("rec.capture.frames", DISPATCH_QUEUE_SERIAL);
+        if (options_.system_audio || options_.microphone)
+            audio_queue_ = dispatch_queue_create("rec.capture.audio", DISPATCH_QUEUE_SERIAL);
+        stream_ = [[SCStream alloc] initWithFilter:filter configuration:config delegate:receiver_];
+        NSError* stream_error = nil;
+        if (![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeScreen
+                  sampleHandlerQueue:queue_ error:&stream_error]) {
+            cleanup_capture();
+            return {message(stream_error, "could not subscribe to screen frames")};
+        }
+        if (options_.system_audio &&
+            ![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeAudio
+                  sampleHandlerQueue:audio_queue_ error:&stream_error]) {
+            cleanup_capture();
+            return {message(stream_error, "could not subscribe to system audio")};
+        }
+        if (options_.microphone) {
+            if (@available(macOS 15.0, *)) {
+                if (![stream_ addStreamOutput:receiver_ type:SCStreamOutputTypeMicrophone
+                          sampleHandlerQueue:audio_queue_ error:&stream_error]) {
+                    cleanup_capture();
+                    return {message(stream_error, "could not subscribe to the microphone")};
+                }
+            }
+        }
+        auto started = wait_capture(stream_, true);
+        if (!started) { cleanup_capture(); return started; }
+        active_ = true;
+        {
+            std::unique_lock lock(mutex_);
+            if (!frames_ready_.wait_for(lock, std::chrono::seconds(8), [this] {
+                return !pending_.empty() || !failure_.empty();
+            })) {
+                error = "no screen frames arrived within 8 seconds (check Screen Recording permission)";
+            } else if (!failure_.empty()) {
+                error = failure_;
+            }
+        }
+        if (!error.empty()) { stop(); return {error}; }
+        return {};
+    }
+
+    AVAssetWriterInput* add_audio_input(std::uint32_t channels, std::uint32_t bitrate) {
+        NSDictionary* settings = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @(kMixRate),
+            AVNumberOfChannelsKey: @(channels),
+            AVEncoderBitRateKey: @(bitrate)
+        };
+        AVAssetWriterInput* input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                                                       outputSettings:settings];
+        input.expectsMediaDataInRealTime = YES;
+        if (![writer_ canAddInput:input]) return nil;
+        [writer_ addInput:input];
+        return input;
+    }
+
     Result create_writer() {
         NSString* path = [NSString stringWithUTF8String:options_.output.c_str()];
         NSURL* url = [NSURL fileURLWithPath:path];
@@ -359,19 +776,39 @@ private:
         input_.expectsMediaDataInRealTime = YES;
         if (![writer_ canAddInput:input_]) return {"video encoder cannot accept the selected settings"};
         [writer_ addInput:input_];
-        if (options_.test_tone || options_.system_audio) {
-            NSDictionary* audioSettings = @{
-                AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-                AVSampleRateKey: @48000,
-                AVNumberOfChannelsKey: @2,
-                AVEncoderBitRateKey: @192000
-            };
-            audio_input_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
-                                                           outputSettings:audioSettings];
-            audio_input_.expectsMediaDataInRealTime = YES;
-            if (![writer_ canAddInput:audio_input_]) return {"AAC writer cannot accept synthetic audio"};
-            [writer_ addInput:audio_input_];
+
+        // Track order is the order inputs are added: the mix first, so it is the default track.
+        const bool system = audio_[kSystem].enabled, mic = audio_[kMic].enabled;
+        mixing_ = system && mic && options_.audio_tracks != AudioTracks::stems;
+        const bool stems = !mixing_ || options_.audio_tracks == AudioTracks::both;
+        NSMutableArray<AVAssetWriterInput*>* audio_inputs = [NSMutableArray array];
+        if (mixing_) {
+            mix_input_ = add_audio_input(2, 256000);
+            if (!mix_input_) return {"AAC writer cannot accept the audio mix"};
+            [audio_inputs addObject:mix_input_];
+            mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
+            mix_format_ = pcm_format(2, true);
+            if (!mix_format_) return {"could not describe the audio mix format"};
         }
+        if (system && stems) {
+            audio_[kSystem].stem = add_audio_input(2, 256000);
+            if (!audio_[kSystem].stem) return {"AAC writer cannot accept system audio"};
+            [audio_inputs addObject:audio_[kSystem].stem];
+        }
+        if (mic && stems) {
+            audio_[kMic].stem = add_audio_input(1, 128000);
+            if (!audio_[kMic].stem) return {"AAC writer cannot accept the microphone"};
+            [audio_inputs addObject:audio_[kMic].stem];
+        }
+        if (audio_inputs.count > 1) {
+            // One alternate group: players use the default (mix), editors see every track.
+            AVAssetWriterInputGroup* group = [AVAssetWriterInputGroup
+                assetWriterInputGroupWithInputs:audio_inputs defaultInput:audio_inputs.firstObject];
+            if ([writer_ canAddInputGroup:group]) [writer_ addInputGroup:group];
+        }
+        if (options_.test_tone) tone_format_ = pcm_format(2, false);
+        if (options_.test_mic) mic_tone_format_ = pcm_format(1, false);
+
         // No adaptor pool: SCK's IOSurface-backed pixel buffer goes to VideoToolbox unchanged.
         adaptor_ = [AVAssetWriterInputPixelBufferAdaptor
             assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input_ sourcePixelBufferAttributes:nil];
@@ -380,154 +817,204 @@ private:
         return {};
     }
 
-    void write_system_audio() {
-        if (!audio_input_ || !options_.system_audio) return;
-        // Drain on the recording thread. Never encode or block in the SCK callback.
-        for (std::size_t packet = 0; packet < audio_packets_.size(); ++packet) {
-            CMSampleBufferRef sample = nullptr;
-            {
-                std::lock_guard lock(mutex_);
-                if (!audio_count_) break;
-                sample = audio_packets_[audio_head_];
-                audio_packets_[audio_head_] = nullptr;
-                audio_head_ = (audio_head_ + 1) % audio_packets_.size();
-                --audio_count_;
-            }
-            if (!sample) continue;
-            const auto timestamp = CMSampleBufferGetPresentationTimeStamp(sample);
-            if (!CMTIME_IS_VALID(timestamp) || CMTimeCompare(timestamp, host_origin_) < 0) {
-                audio_dropped_.fetch_add(1);
-                CFRelease(sample);
-                continue;
-            }
+    // The frame on screen at the slot's instant: the newest delivered frame whose
+    // timestamp is not after it. Runs on the recording thread, which owns current_.
+    CVPixelBufferRef select_frame(std::uint64_t slot) {
+        if (options_.test_pattern) {
+            const auto flash_slots = std::max<std::uint64_t>(1, options_.fps / 10);
+            return pattern_[slot % options_.fps < flash_slots ? 1 : 0];
+        }
+        const CMTime due = CMTimeAdd(host_origin_, CMTimeMake(static_cast<int64_t>(slot),
+                                                             static_cast<int32_t>(options_.fps)));
+        std::lock_guard lock(mutex_);
+        while (!pending_.empty() &&
+               (!current_.pixel || CMTimeCompare(pending_.front().pts, due) <= 0)) {
+            if (current_.pixel) CVPixelBufferRelease(current_.pixel);
+            current_ = pending_.pop();
+        }
+        return current_.pixel;
+    }
 
-            CMItemCount entries = 0;
-            auto status = CMSampleBufferGetSampleTimingInfoArray(sample, 0, nullptr, &entries);
-            std::array<CMSampleTimingInfo, 8> timing{};
-            if (status != noErr || entries < 1 ||
-                entries > static_cast<CMItemCount>(timing.size())) {
-                audio_dropped_.fetch_add(1);
-                CFRelease(sample);
-                continue;
-            }
-            status = CMSampleBufferGetSampleTimingInfoArray(sample, entries, timing.data(), &entries);
-            if (status != noErr) {
-                audio_dropped_.fetch_add(1);
-                CFRelease(sample);
-                continue;
-            }
-            for (CMItemCount i = 0; i < entries; ++i) {
-                if (CMTIME_IS_VALID(timing[i].presentationTimeStamp))
-                    timing[i].presentationTimeStamp =
-                        CMTimeSubtract(timing[i].presentationTimeStamp, host_origin_);
-                if (CMTIME_IS_VALID(timing[i].decodeTimeStamp))
-                    timing[i].decodeTimeStamp =
-                        CMTimeSubtract(timing[i].decodeTimeStamp, host_origin_);
-            }
+    bool append_retimed(AVAssetWriterInput* input, CMSampleBufferRef sample, CMTime shift) {
+        CMItemCount entries = 0;
+        auto status = CMSampleBufferGetSampleTimingInfoArray(sample, 0, nullptr, &entries);
+        std::array<CMSampleTimingInfo, 8> timing{};
+        if (status != noErr || entries < 1 || entries > static_cast<CMItemCount>(timing.size())) return false;
+        status = CMSampleBufferGetSampleTimingInfoArray(sample, entries, timing.data(), &entries);
+        if (status != noErr) return false;
+        for (CMItemCount i = 0; i < entries; ++i) {
+            if (CMTIME_IS_VALID(timing[i].presentationTimeStamp))
+                timing[i].presentationTimeStamp = CMTimeAdd(timing[i].presentationTimeStamp, shift);
+            if (CMTIME_IS_VALID(timing[i].decodeTimeStamp))
+                timing[i].decodeTimeStamp = CMTimeAdd(timing[i].decodeTimeStamp, shift);
+        }
+        CMSampleBufferRef adjusted = nullptr;
+        status = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, sample, entries, timing.data(), &adjusted);
+        if (status != noErr || !adjusted) return false;
+        const bool appended = [input appendSampleBuffer:adjusted];
+        CFRelease(adjusted);
+        return appended;
+    }
 
-            CMSampleBufferRef adjusted = nullptr;
-            status = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, sample,
-                                                            entries, timing.data(), &adjusted);
-            CFRelease(sample);
-            if (status != noErr || !adjusted) {
-                audio_dropped_.fetch_add(1);
-                continue;
-            }
-            if (audio_input_.readyForMoreMediaData &&
-                [audio_input_ appendSampleBuffer:adjusted]) {
-                audio_written_.fetch_add(1);
+    // Routes one buffer to its stem and the mix. Returns false, without side effects,
+    // when the stem input cannot accept data yet.
+    bool process_audio(Source kind, CMSampleBufferRef sample) {
+        auto& source = audio_[kind];
+        if (source.stem && !source.stem.readyForMoreMediaData) return false;
+        const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+        if (!CMTIME_IS_NUMERIC(pts)) {
+            source.dropped.fetch_add(1);
+            return true;
+        }
+        // Host clock to recording time, plus the source's sync offset.
+        const CMTime shift = CMTimeSubtract(source.offset, host_origin_);
+        const CMTime start = CMTimeAdd(pts, shift);
+        bool used = false;
+        if (source.stem && CMTimeCompare(start, kCMTimeZero) >= 0) {
+            if (append_retimed(source.stem, sample, shift)) {
+                used = true;
             } else {
-                audio_dropped_.fetch_add(1);
-                if (writer_.status == AVAssetWriterStatusFailed) {
-                    std::lock_guard lock(mutex_);
-                    failure_ = message(writer_.error, "system audio encoding failed");
-                    finished_.store(true);
-                }
+                source.dropped.fetch_add(1);
+                if (writer_.status == AVAssetWriterStatusFailed)
+                    fail(message(writer_.error, "audio encoding failed"));
             }
-            CFRelease(adjusted);
+        }
+        if (mixing_) {
+            if (stereo_pcm(sample, pcm_, scratch_)) {
+                auto first = static_cast<std::int64_t>(std::llround(CMTimeGetSeconds(start) * kMixRate));
+                // Timestamps jitter by a sample or two; keep a continuous stream continuous.
+                if (source.next_mix != INT64_MIN && std::llabs(first - source.next_mix) <= kMixRate / 1000)
+                    first = source.next_mix;
+                const auto frames = pcm_.size() / 2;
+                source.next_mix = first + static_cast<std::int64_t>(frames);
+                mixer_.add(kind, first, pcm_.data(), frames, source.gain);
+                used = true;
+            } else if (!source.stem) {
+                source.dropped.fetch_add(1);
+            }
+        }
+        if (used) source.written.fetch_add(1);
+        return true;
+    }
+
+    void emit_mix(bool flush) {
+        if (!mixing_ || !mix_input_) return;
+        const auto system_end = mixer_.end(kSystem), mic_end = mixer_.end(kMic);
+        std::int64_t target = flush ? std::max(system_end, mic_end) : std::min(system_end, mic_end);
+        if (!flush && !options_.test_pattern) {
+            const CMTime now = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), host_origin_);
+            target = std::max(target, static_cast<std::int64_t>(CMTimeGetSeconds(now) * kMixRate) - kMixWaitFrames);
+        }
+        target = std::min(target, mixer_.emitted() + mixer_.capacity());
+        while (mixer_.emitted() < target) {
+            if (!mix_input_.readyForMoreMediaData) {
+                if (!flush) return;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                while (!mix_input_.readyForMoreMediaData && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (!mix_input_.readyForMoreMediaData) return;
+            }
+            const auto first = mixer_.emitted();
+            const auto frames = static_cast<std::size_t>(std::min<std::int64_t>(target - first, 4096));
+            mixer_.take(frames, mixed_);
+            CMSampleBufferRef sample = pcm_buffer(mix_format_, mixed_.data(), mixed_.size() * sizeof(float),
+                                                  frames, CMTimeMake(first, kMixRate));
+            if (!sample) { fail("could not create an audio mix buffer"); return; }
+            if ([mix_input_ appendSampleBuffer:sample]) {
+                mix_written_.fetch_add(1);
+            } else if (writer_.status == AVAssetWriterStatusFailed) {
+                fail(message(writer_.error, "audio mix encoding failed"));
+            }
+            CFRelease(sample);
         }
     }
 
-    bool write_test_tone(std::uint64_t sample_limit) {
-        if (!audio_input_) return true;
-        AudioStreamBasicDescription format{};
-        format.mSampleRate = 48000;
-        format.mFormatID = kAudioFormatLinearPCM;
-        format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-        format.mBytesPerPacket = 4;
-        format.mFramesPerPacket = 1;
-        format.mBytesPerFrame = 4;
-        format.mChannelsPerFrame = 2;
-        format.mBitsPerChannel = 16;
-
-        CMAudioFormatDescriptionRef description = nullptr;
-        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &format, 0, nullptr, 0,
-                                            nullptr, nullptr, &description) != noErr)
-            return false;
-
-        bool ok = true;
-        while (audio_samples_ < sample_limit && !stop_requested_.load() && !finished_.load()) {
-            const auto count = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(1024, sample_limit - audio_samples_));
-            std::vector<std::int16_t> samples(count * 2);
-            for (std::uint32_t i = 0; i < count; ++i) {
-                const auto index = audio_samples_ + i;
-                // A short 440 Hz beep at the start of every second.
-                const double phase = 2.0 * 3.141592653589793 * 440.0 * (index % 48000) / 48000.0;
-                const auto value = static_cast<std::int16_t>((index % 48000 < 4800)
-                    ? std::sin(phase) * 8000.0 : 0.0);
-                samples[i * 2] = value;
-                samples[i * 2 + 1] = value;
+    // Drains captured audio on the recording thread. Never encode or block in a callback.
+    void pump_audio(bool flush) {
+        for (auto kind : {kSystem, kMic}) {
+            auto& source = audio_[kind];
+            if (!source.enabled) continue;
+            for (int packets = 0; packets < 64; ++packets) {
+                if (!source.held) {
+                    std::lock_guard lock(mutex_);
+                    source.held = source.queue.pop();
+                }
+                if (!source.held) break;
+                bool done = process_audio(kind, source.held);
+                if (!done && flush) {
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                    while (!done && std::chrono::steady_clock::now() < deadline) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        done = process_audio(kind, source.held);
+                    }
+                    if (!done) source.dropped.fetch_add(1);
+                } else if (!done) {
+                    break;
+                }
+                CFRelease(source.held);
+                source.held = nullptr;
             }
-            CMBlockBufferRef block = nullptr;
-            const auto bytes = samples.size() * sizeof(std::int16_t);
-            if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes,
-                kCFAllocatorDefault, nullptr, 0, bytes, 0, &block) != kCMBlockBufferNoErr) {
-                ok = false; break;
-            }
-            if (CMBlockBufferReplaceDataBytes(samples.data(), block, 0, bytes) != kCMBlockBufferNoErr) {
-                CFRelease(block); ok = false; break;
-            }
-            CMSampleTimingInfo timing{CMTimeMake(1, 48000),
-                                      CMTimeMake(static_cast<std::int64_t>(audio_samples_), 48000),
-                                      kCMTimeInvalid};
-            CMSampleBufferRef sample = nullptr;
-            const auto status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, description,
-                                                          count, 1, &timing, 0, nullptr, &sample);
-            CFRelease(block);
-            if (status != noErr || !sample) { ok = false; break; }
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-            while (!audio_input_.readyForMoreMediaData && !stop_requested_.load() &&
-                   std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            if (!audio_input_.readyForMoreMediaData || ![audio_input_ appendSampleBuffer:sample]) {
-                ok = false;
-            } else {
-                audio_samples_ += count;
-            }
-            CFRelease(sample);
-            if (!ok) break;
         }
-        CFRelease(description);
-        return ok;
+        emit_mix(flush);
+    }
+
+    // Takes ownership of sample. Synthetic audio must not be lost, so wait briefly for the input.
+    bool submit_synthetic(Source kind, CMSampleBufferRef sample) {
+        if (!sample) return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        bool done = process_audio(kind, sample);
+        while (!done && !stop_requested_.load() && std::chrono::steady_clock::now() < deadline) {
+            emit_mix(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            done = process_audio(kind, sample);
+        }
+        CFRelease(sample);
+        return done;
+    }
+
+    // Synthetic sources follow the written video, so CI gets a deterministic A/V timeline:
+    // a 100 ms 440 Hz beep starting with every one-second flash, and a quiet 1 kHz "mic".
+    bool write_synthetic_audio(std::uint64_t until) {
+        std::array<std::int16_t, 2048> tone{};
+        std::array<std::int16_t, 1024> mic{};
+        while (synthetic_samples_ < until && !stop_requested_.load() && !finished_.load()) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(1024, until - synthetic_samples_));
+            const CMTime pts = CMTimeAdd(host_origin_, CMTimeMake(static_cast<int64_t>(synthetic_samples_), kMixRate));
+            if (options_.test_tone) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto index = (synthetic_samples_ + i) % kMixRate;
+                    const double phase = kTwoPi * 440.0 * static_cast<double>(index) / kMixRate;
+                    const auto value = static_cast<std::int16_t>(index < kMixRate / 10 ? std::sin(phase) * 8000.0 : 0.0);
+                    tone[i * 2] = tone[i * 2 + 1] = value;
+                }
+                if (!submit_synthetic(kSystem, pcm_buffer(tone_format_, tone.data(), count * 4, count, pts)))
+                    return false;
+            }
+            if (options_.test_mic) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const double phase = kTwoPi * 1000.0 * static_cast<double>(synthetic_samples_ + i) / kMixRate;
+                    mic[i] = static_cast<std::int16_t>(std::sin(phase) * 300.0);
+                }
+                if (!submit_synthetic(kMic, pcm_buffer(mic_tone_format_, mic.data(), count * 2, count, pts)))
+                    return false;
+            }
+            synthetic_samples_ += count;
+        }
+        return true;
     }
 
     void run() {
         using namespace std::chrono;
-        const auto begin = steady_clock::now();
+        const auto delay = options_.test_pattern ? nanoseconds(0) : duration_cast<nanoseconds>(kEmitDelay);
         const auto limit = options_.duration_seconds > 0
             ? static_cast<std::uint64_t>(std::llround(options_.duration_seconds * options_.fps)) : UINT64_MAX;
+        const CMTimeScale scale = static_cast<CMTimeScale>(options_.fps);
         for (std::uint64_t slot = 0; slot < limit && !stop_requested_.load() && !finished_; ++slot) {
-            const auto tick = begin + nanoseconds(slot * 1000000000ull / options_.fps);
+            const auto tick = begin_ + nanoseconds(slot * 1000000000ull / options_.fps) + delay;
             std::this_thread::sleep_until(tick);
             if (stop_requested_.load() || finished_) break;
             @autoreleasepool {
-                CVPixelBufferRef frame = nullptr;
-                {
-                    std::lock_guard lock(mutex_);
-                    frame = newest_;
-                    if (frame) CVPixelBufferRetain(frame);
-                }
+                CVPixelBufferRef frame = select_frame(slot);
                 // Retry the same timestamp for up to 500 ms on transient backpressure.
                 // Never hold a stream callback or create an unbounded frame queue.
                 bool appended = false;
@@ -535,32 +1022,29 @@ private:
                 while (frame && !stop_requested_.load() && !finished_.load() &&
                        steady_clock::now() < deadline && writer_.status != AVAssetWriterStatusFailed) {
                     if (input_.readyForMoreMediaData &&
-                        [adaptor_ appendPixelBuffer:frame withPresentationTime:
-                            CMTimeMake(static_cast<int64_t>(slot), static_cast<int32_t>(options_.fps))]) {
+                        [adaptor_ appendPixelBuffer:frame
+                               withPresentationTime:CMTimeMake(static_cast<int64_t>(slot), scale)]) {
                         appended = true;
                         break;
                     }
+                    // AVAssetWriter interleaves inputs: keep audio moving so video can become ready.
+                    pump_audio(false);
                     std::this_thread::sleep_for(milliseconds(2));
                 }
                 if (appended) {
                     written_.fetch_add(1);
-                    const auto target = ((slot + 1) * 48000ull) / options_.fps;
-                    if (options_.test_tone && !write_test_tone(target)) {
-                        std::lock_guard lock(mutex_);
-                        failure_ = message(writer_.error, "synthetic AAC append failed");
-                        finished_.store(true);
-                    }
-                } else if (!stop_requested_.load()) dropped_.fetch_add(1);
-                if (writer_.status == AVAssetWriterStatusFailed) {
-                    std::lock_guard lock(mutex_);
-                    failure_ = message(writer_.error, "video encoding failed");
-                    finished_.store(true);
+                    if ((options_.test_tone || options_.test_mic) &&
+                        !write_synthetic_audio(((slot + 1) * static_cast<std::uint64_t>(kMixRate)) / options_.fps) &&
+                        !stop_requested_.load())
+                        fail(message(writer_.error, "synthetic audio append failed"));
+                } else if (!stop_requested_.load()) {
+                    dropped_.fetch_add(1);
                 }
-                if (frame) CVPixelBufferRelease(frame);
-                write_system_audio();
+                if (writer_.status == AVAssetWriterStatusFailed)
+                    fail(message(writer_.error, "video encoding failed"));
+                pump_audio(false);
             }
         }
-        if (!stop_requested_.load()) write_system_audio();
         finished_.store(true);
     }
 
@@ -569,36 +1053,67 @@ private:
         receiver_ = nil;
         stream_ = nil;
         queue_ = nil;
-        audio_dispatch_queue_ = nil;
+        audio_queue_ = nil;
     }
 
     Options options_;
     Size size_{};
     mutable std::mutex mutex_;
     std::condition_variable frames_ready_;
-    CVPixelBufferRef newest_ = nullptr;
+    FrameRing pending_;                 // Guarded by mutex_.
+    Frame current_;                     // Recording thread only.
+    std::array<CVPixelBufferRef, 2> pattern_{};
     std::string failure_;
     SCStream* __strong stream_ = nil;
     RecCaptureOutput* __strong receiver_ = nil;
     dispatch_queue_t queue_ = nullptr;
-    dispatch_queue_t audio_dispatch_queue_ = nullptr;
-    std::array<CMSampleBufferRef, 16> audio_packets_{};
-    std::size_t audio_head_ = 0;
-    std::size_t audio_count_ = 0;
+    dispatch_queue_t audio_queue_ = nullptr;
+    std::array<AudioSource, 2> audio_;
+    double system_offset_ms_ = 0;
+    bool mixing_ = false;
+    Mixer mixer_;
+    AVAssetWriterInput* __strong mix_input_ = nil;
+    std::vector<float> pcm_, mixed_;
+    std::vector<std::byte> scratch_;
+    CMAudioFormatDescriptionRef mix_format_ = nullptr;
+    CMAudioFormatDescriptionRef tone_format_ = nullptr;
+    CMAudioFormatDescriptionRef mic_tone_format_ = nullptr;
+    std::uint64_t synthetic_samples_ = 0;
     CMTime host_origin_ = kCMTimeInvalid;
+    std::chrono::steady_clock::time_point begin_{};
     AVAssetWriter* __strong writer_ = nil;
     AVAssetWriterInput* __strong input_ = nil;
-    AVAssetWriterInput* __strong audio_input_ = nil;
-    std::uint64_t audio_samples_ = 0;
     AVAssetWriterInputPixelBufferAdaptor* __strong adaptor_ = nil;
     id __strong activity_ = nil;
     std::thread pacer_;
     std::atomic_bool stop_requested_{false};
     std::atomic_bool active_{false};
+    std::atomic_bool recording_{false};
     std::atomic_bool finished_{false};
-    std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0};
-    std::atomic<std::uint64_t> audio_written_{0}, audio_dropped_{0};
+    std::atomic<std::uint64_t> captured_{0}, written_{0}, dropped_{0}, mix_written_{0};
 };
+
+namespace {
+double brightness(CVPixelBufferRef pixel) {
+    if (!pixel || CVPixelBufferLockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return 0;
+    const auto* base = static_cast<const std::uint8_t*>(CVPixelBufferGetBaseAddress(pixel));
+    const auto stride = CVPixelBufferGetBytesPerRow(pixel);
+    const auto width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel);
+    std::uint64_t sum = 0, count = 0;
+    if (base) {
+        const auto step_x = std::max<std::size_t>(1, width / 64), step_y = std::max<std::size_t>(1, height / 36);
+        for (std::size_t y = step_y / 2; y < height; y += step_y) {
+            for (std::size_t x = step_x / 2; x < width; x += step_x) {
+                const auto* bgra = base + y * stride + x * 4;
+                sum += bgra[0] + bgra[1] + bgra[2];
+                count += 3;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly);
+    return count ? static_cast<double>(sum) / (255.0 * static_cast<double>(count)) : 0;
+}
+} // namespace
 
 Result probe_file(const std::string& path, Probe& probe) {
     @autoreleasepool {
@@ -624,6 +1139,8 @@ Result probe_file(const std::string& path, Probe& probe) {
         [reader addOutput:output];
         if (![reader startReading]) return {message(reader.error, "video decode start failed")};
         CMTime previous = kCMTimeInvalid;
+        std::vector<double> flashes;
+        bool bright = false;
         while (CMSampleBufferRef sample = [output copyNextSampleBuffer]) {
             const CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sample);
             if (CMTIME_IS_VALID(previous) && CMTimeCompare(timestamp, previous) <= 0) {
@@ -633,35 +1150,84 @@ Result probe_file(const std::string& path, Probe& probe) {
             }
             previous = timestamp;
             ++probe.frames;
+            const bool now_bright = brightness(CMSampleBufferGetImageBuffer(sample)) > 0.8;
+            if (now_bright && !bright) flashes.push_back(CMTimeGetSeconds(timestamp));
+            bright = now_bright;
             CFRelease(sample);
         }
         if (reader.status != AVAssetReaderStatusCompleted)
             return {message(reader.error, "video decode failed")};
         if (!probe.frames) return {"no decoded frames"};
         probe.duration_seconds = CMTimeGetSeconds(track.timeRange.duration);
-        AVAssetTrack* audio = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+
+        NSArray<AVAssetTrack*>* audio_tracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+        probe.audio_tracks = static_cast<std::uint32_t>(audio_tracks.count);
+        AVAssetTrack* audio = audio_tracks.firstObject;
+        std::vector<double> beeps;
         if (audio) {
-            CMFormatDescriptionRef audioFormat =
+            CMFormatDescriptionRef audio_format =
                 (__bridge CMFormatDescriptionRef)audio.formatDescriptions.firstObject;
-            const auto subtype = audioFormat ? CMFormatDescriptionGetMediaSubType(audioFormat) : 0;
+            const auto subtype = audio_format ? CMFormatDescriptionGetMediaSubType(audio_format) : 0;
             probe.audio_codec = subtype == kAudioFormatMPEG4AAC ? "aac" : "other";
             probe.audio_duration_seconds = CMTimeGetSeconds(audio.timeRange.duration);
-            NSError* audioError = nil;
-            AVAssetReader* audioReader = [[AVAssetReader alloc] initWithAsset:asset error:&audioError];
-            if (!audioReader) return {message(audioError, "could not open audio track")};
-            AVAssetReaderTrackOutput* audioOutput = [[AVAssetReaderTrackOutput alloc]
-                initWithTrack:audio outputSettings:@{AVFormatIDKey: @(kAudioFormatLinearPCM)}];
-            if (![audioReader canAddOutput:audioOutput]) return {"could not decode audio"};
-            [audioReader addOutput:audioOutput];
-            if (![audioReader startReading]) return {message(audioReader.error, "audio decode start failed")};
-            while (CMSampleBufferRef buffer = [audioOutput copyNextSampleBuffer]) {
+            NSError* audio_error = nil;
+            AVAssetReader* audio_reader = [[AVAssetReader alloc] initWithAsset:asset error:&audio_error];
+            if (!audio_reader) return {message(audio_error, "could not open audio track")};
+            AVAssetReaderTrackOutput* audio_output = [[AVAssetReaderTrackOutput alloc]
+                initWithTrack:audio outputSettings:@{
+                    AVFormatIDKey: @(kAudioFormatLinearPCM),
+                    AVLinearPCMBitDepthKey: @32,
+                    AVLinearPCMIsFloatKey: @YES,
+                    AVLinearPCMIsNonInterleaved: @NO,
+                    AVLinearPCMIsBigEndianKey: @NO
+                }];
+            if (![audio_reader canAddOutput:audio_output]) return {"could not decode audio"};
+            [audio_reader addOutput:audio_output];
+            if (![audio_reader startReading]) return {message(audio_reader.error, "audio decode start failed")};
+            std::vector<float> samples;
+            double last_loud = -1e9;
+            while (CMSampleBufferRef buffer = [audio_output copyNextSampleBuffer]) {
                 ++probe.audio_buffers;
+                const auto* description =
+                    CMAudioFormatDescriptionGetStreamBasicDescription(CMSampleBufferGetFormatDescription(buffer));
+                CMBlockBufferRef block = CMSampleBufferGetDataBuffer(buffer);
+                if (description && block && description->mChannelsPerFrame && description->mSampleRate > 0 &&
+                    (description->mFormatFlags & kAudioFormatFlagIsFloat) && description->mBitsPerChannel == 32) {
+                    samples.resize(CMBlockBufferGetDataLength(block) / sizeof(float));
+                    if (CMBlockBufferCopyDataBytes(block, 0, samples.size() * sizeof(float), samples.data()) ==
+                        kCMBlockBufferNoErr) {
+                        const double start = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer));
+                        const auto channels = description->mChannelsPerFrame;
+                        for (std::size_t frame = 0; frame < samples.size() / channels; ++frame) {
+                            float peak = 0;
+                            for (UInt32 c = 0; c < channels; ++c)
+                                peak = std::max(peak, std::fabs(samples[frame * channels + c]));
+                            if (peak < 0.1f) continue;
+                            // An onset is the first loud sample after at least 200 ms without one.
+                            const double t = start + static_cast<double>(frame) / description->mSampleRate;
+                            if (t - last_loud >= 0.2) beeps.push_back(t);
+                            last_loud = t;
+                        }
+                    }
+                }
                 CFRelease(buffer);
             }
-            if (audioReader.status != AVAssetReaderStatusCompleted)
-                return {message(audioReader.error, "audio decode failed")};
+            if (audio_reader.status != AVAssetReaderStatusCompleted)
+                return {message(audio_reader.error, "audio decode failed")};
             if (!probe.audio_buffers) return {"audio track has no decoded samples"};
         }
+
+        double total = 0;
+        for (const double flash : flashes) {
+            double best = 1e9;
+            for (const double beep : beeps)
+                if (std::fabs(beep - flash) < std::fabs(best)) best = beep - flash;
+            if (std::fabs(best) > 0.5) continue;
+            ++probe.sync_events;
+            total += best * 1000.0;
+            probe.av_offset_max_ms = std::max(probe.av_offset_max_ms, std::fabs(best) * 1000.0);
+        }
+        if (probe.sync_events) probe.av_offset_ms = total / probe.sync_events;
         return {};
     }
 }
@@ -669,8 +1235,8 @@ Result probe_file(const std::string& path, Probe& probe) {
 void receive_frame(void* owner, CMSampleBufferRef sample) {
     static_cast<CaptureState*>(owner)->on_frame(sample);
 }
-void receive_audio(void* owner, CMSampleBufferRef sample) {
-    static_cast<CaptureState*>(owner)->on_audio(sample);
+void receive_audio(void* owner, CMSampleBufferRef sample, bool microphone) {
+    static_cast<CaptureState*>(owner)->on_audio(sample, microphone);
 }
 void receive_failure(void* owner, NSError* error) {
     static_cast<CaptureState*>(owner)->on_failure(error);

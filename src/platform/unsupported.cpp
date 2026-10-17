@@ -5,6 +5,11 @@ std::vector<Display> list_displays(std::string& error) {
     error = "screen capture requires macOS 15 or newer";
     return {};
 }
+std::vector<AudioDevice> list_microphones(std::string& error) {
+    error = "microphone capture requires macOS 15 or newer";
+    return {};
+}
+double default_output_latency_ms() noexcept { return 0; }
 Result probe_file(const std::string&, Probe&) { return {"probing recordings requires macOS"}; }
 class Recorder::Impl {};
 Recorder::Recorder(Options) : impl_(std::make_unique<Impl>()) {}

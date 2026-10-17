@@ -13,7 +13,7 @@ if(APPLE)
     target_link_libraries(rec PUBLIC
         "-framework Foundation" "-framework ScreenCaptureKit" "-framework AVFoundation"
         "-framework CoreMedia" "-framework CoreVideo" "-framework CoreGraphics"
-        "-framework VideoToolbox" "-framework AudioToolbox")
+        "-framework VideoToolbox" "-framework AudioToolbox" "-framework CoreAudio")
 else()
     target_sources(rec PRIVATE src/platform/unsupported.cpp)
 endif()
@@ -21,6 +21,12 @@ endif()
 add_executable(rec-cli src/main.cpp)
 target_link_libraries(rec-cli PRIVATE rec)
 set_target_properties(rec-cli PROPERTIES OUTPUT_NAME rec)
+if(APPLE)
+    # Privacy prompts read usage descriptions from the executable's embedded Info.plist.
+    target_link_options(rec-cli PRIVATE
+        "LINKER:-sectcreate,__TEXT,__info_plist,${CMAKE_CURRENT_SOURCE_DIR}/support/Info.plist")
+    set_property(TARGET rec-cli APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/support/Info.plist")
+endif()
 
 install(TARGETS rec rec-cli EXPORT recTargets)
 install(DIRECTORY include/ DESTINATION include)

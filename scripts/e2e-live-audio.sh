@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
+# Live A/V sync acceptance on a Mac with Screen Recording permission and audible output.
+# A full-screen window flashes white with a simultaneous beep once a second while rec
+# records the display and system audio; rec probe then measures the offset in the file.
+# REC_E2E_MIC=1 also records the default microphone (mix + stems).
 set -euo pipefail
 
-[[ "$(uname -s)" == Darwin ]] || { echo 'live audio E2E requires macOS' >&2; exit 1; }
-command -v python3 >/dev/null || { echo 'python3 is required for the audio stimulus' >&2; exit 1; }
-command -v afplay >/dev/null || { echo 'afplay is required for system audio playback' >&2; exit 1; }
+[[ "$(uname -s)" == Darwin ]] || { echo 'live A/V sync E2E requires macOS' >&2; exit 1; }
+command -v swiftc >/dev/null || { echo 'swiftc (Xcode command line tools) is required' >&2; exit 1; }
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-artifacts="${REC_E2E_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rec-live-audio.XXXXXX")}"
+artifacts="${REC_E2E_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rec-live-sync.XXXXXX")}"
 mkdir -p "$artifacts"
 capture_pid=""
 cleanup() {
@@ -20,49 +23,40 @@ trap cleanup EXIT
 cmake -S "$root" -B "$root/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$root/build" --parallel
 rec="$root/build/rec"
+swiftc -O "$root/scripts/flash-beep.swift" -o "$artifacts/flash-beep"
 
-# A deterministic two-second WAV stimulus, played from a separate process so
-# ScreenCaptureKit excludes only rec's own sounds, not this test's playback.
-python3 - "$artifacts/stimulus.wav" <<'PY'
-import math
-import struct
-import sys
-import wave
-
-rate = 48000
-with wave.open(sys.argv[1], "wb") as wav:
-    wav.setnchannels(2)
-    wav.setsampwidth(2)
-    wav.setframerate(rate)
-    frames = bytearray()
-    for n in range(rate * 2):
-        pulse = (n % (rate // 2)) < (rate // 8)
-        sample = int(10000 * math.sin(2 * math.pi * 440 * n / rate)) if pulse else 0
-        frames += struct.pack("<hh", sample, sample)
-    wav.writeframes(frames)
-PY
+args=(record --display 1 --system-audio -r 1080p -f 60 -t 12 --codec h264 -o "$artifacts/recording.mov")
+if [[ "${REC_E2E_MIC:-0}" == 1 ]]; then args+=(--mic default); fi
 
 echo "Saving recordings and evidence to: $artifacts"
-"$rec" record --display 1 --system-audio -r 1080p -f 30 -t 8 \
-    --codec h264 -o "$artifacts/recording.mov" >"$artifacts/record.log" 2>&1 &
+"$rec" devices | tee "$artifacts/devices.txt"
+"$rec" "${args[@]}" >"$artifacts/record.log" 2>&1 &
 capture_pid="$!"
 
 # Allow the recorder to establish its screen/audio stream and first video frame.
 sleep 3
 if ! kill -0 "$capture_pid" 2>/dev/null; then
   wait "$capture_pid" || true
-  echo "Recording stopped before audio playback; see $artifacts/record.log" >&2
+  echo "Recording stopped before the stimulus; see $artifacts/record.log" >&2
   exit 1
 fi
 
-afplay "$artifacts/stimulus.wav"
+# Separate process: ScreenCaptureKit excludes only rec's own audio.
+"$artifacts/flash-beep" 6 >"$artifacts/stimulus.log" 2>&1
 wait "$capture_pid" || { echo "Recorder failed; see $artifacts/record.log" >&2; exit 1; }
 capture_pid=""
 
 "$rec" probe "$artifacts/recording.mov" | tee "$artifacts/recording.probe"
+value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$artifacts/recording.probe"; }
 grep -qx 'codec=h264' "$artifacts/recording.probe"
 grep -qx 'audio_codec=aac' "$artifacts/recording.probe"
-awk -F= '/^audio_buffers=/ { if ($2 + 0 > 0) found=1 } END { exit !found }' "$artifacts/recording.probe"
+if [[ "${REC_E2E_MIC:-0}" == 1 ]]; then grep -qx 'audio_tracks=3' "$artifacts/recording.probe"; fi
+events="$(value av_sync_events)"
+offset="$(value av_offset_ms)"
+worst="$(value av_offset_max_ms)"
+awk -v n="$events" 'BEGIN { exit !(n >= 4) }' || { echo "only $events flash/beep pairs found" >&2; exit 1; }
+# ITU-R BT.1359 detectability: audio more than 45 ms early or 125 ms late.
+awk -v m="$offset" 'BEGIN { exit !(m >= -45 && m <= 125) }' || { echo "A/V offset $offset ms is noticeable" >&2; exit 1; }
 
-echo "Live system audio captured and decoded. Inspect A/V timing and audio completeness:"
-echo "$artifacts"
+echo "Live A/V sync: $events flash/beep pairs, mean offset $offset ms (positive = audio late), worst $worst ms."
+echo "Evidence: $artifacts"

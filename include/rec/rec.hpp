@@ -2,12 +2,21 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace rec {
 
 enum class Codec { automatic, h264, hevc };
+
+// Track layout when both system audio and a microphone are recorded.
+// With a single audio source the movie has a single audio track.
+enum class AudioTracks {
+    both,  // Mix (default track), system stem, microphone stem.
+    mix,   // Mix only.
+    stems  // System and microphone stems, no mix.
+};
 
 struct Options {
     std::string output = "rec.mov";
@@ -18,9 +27,17 @@ struct Options {
     std::uint32_t bitrate_mbps = 0; // 0 = selected from resolution
     Codec codec = Codec::automatic;
     bool cursor = true;
-    bool test_pattern = false; // Synthetic frame, for hardware-encoder E2E without screen permission.
-    bool test_tone = false; // Synthetic 48 kHz stereo tone with AAC encoding (requires test_pattern).
+    bool test_pattern = false; // Synthetic flashing frame, for hardware-encoder E2E without screen permission.
+    bool test_tone = false; // Synthetic beep as system audio, once a second with the flash (requires test_pattern).
+    bool test_mic = false; // Synthetic quiet microphone source (requires test_pattern).
     bool system_audio = false; // Opt-in ScreenCaptureKit system audio, 48 kHz stereo AAC.
+    bool microphone = false; // Opt-in ScreenCaptureKit microphone (macOS 15+).
+    std::string microphone_device = "default"; // "default", unique ID, or name substring.
+    AudioTracks audio_tracks = AudioTracks::both;
+    double system_gain_db = 0; // Mix track only.
+    double mic_gain_db = 0; // Mix track only.
+    std::optional<double> system_audio_offset_ms; // Unset: default output device latency (0 for test tone).
+    double mic_offset_ms = 0;
     double duration_seconds = 10.0; // 0 = until stop()
 };
 
@@ -31,12 +48,21 @@ struct Display {
     std::string name;
 };
 
+struct AudioDevice {
+    std::string id;
+    std::string name;
+};
+
 struct Stats {
     std::uint64_t captured = 0;
     std::uint64_t written = 0;
     std::uint64_t dropped = 0;
-    std::uint64_t audio_written = 0;
+    std::uint64_t audio_written = 0; // System audio buffers.
     std::uint64_t audio_dropped = 0;
+    std::uint64_t mic_written = 0;
+    std::uint64_t mic_dropped = 0;
+    std::uint64_t mix_written = 0;
+    double system_audio_offset_ms = 0;
 };
 
 struct Probe {
@@ -45,9 +71,14 @@ struct Probe {
     std::uint32_t height = 0;
     double duration_seconds = 0;
     std::string codec;
-    std::string audio_codec;
+    std::uint32_t audio_tracks = 0;
+    std::string audio_codec; // First (default) audio track.
     std::uint64_t audio_buffers = 0;
     double audio_duration_seconds = 0;
+    // Flash/beep pairs: a dark-to-bright video frame matched with an audio onset within 500 ms.
+    std::uint32_t sync_events = 0;
+    double av_offset_ms = 0; // Mean audio minus video; positive means audio is late.
+    double av_offset_max_ms = 0; // Largest absolute offset.
 };
 
 struct Result {
@@ -57,6 +88,9 @@ struct Result {
 
 // A failure sets error and returns an empty list.
 std::vector<Display> list_displays(std::string& error);
+std::vector<AudioDevice> list_microphones(std::string& error);
+// Time between macOS mixing system audio and the default output device playing it. 0 if unknown.
+double default_output_latency_ms() noexcept;
 Result probe_file(const std::string& path, Probe& probe);
 
 class Recorder {

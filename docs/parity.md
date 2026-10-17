@@ -14,14 +14,16 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | H.264/HEVC MOV/MP4 | Implemented, synthetic E2E verified | Encode, finalize, full AVFoundation decode and frame-count verification |
 | ProRes 422 | Missing | MOV, quality and file-size inspection |
 | GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
-| System audio | Experimental SCK capture, unverified on a permissioned Mac | Verify audio present, drift, output-device latency compensation, overload, sleep and device changes |
-| Microphone | Missing | Mono/stereo input, sample-rate conversion, disconnect/reconnect |
-| Mixed audio and separate stems | Missing | Gain, clipping, offsets, gap handling, separate importable tracks |
+| System audio | SCK capture with output-latency offset; live sync unverified on a permissioned Mac | `scripts/e2e-live-audio.sh`: flash/beep offset within ITU window; drift, overload, sleep and device changes |
+| Microphone | SCK capture (macOS 15), device selection; unverified on a permissioned Mac | `REC_E2E_MIC=1 scripts/e2e-live-audio.sh`; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
+| Mixed audio and separate stems | Implemented; synthetic mix + stems verified on macOS CI | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
+| Single-clock A/V sync | Implemented: timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms in CI | Live flash/beep offset, 30-minute drift |
 | Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
 | Pause/resume | Missing | Video and audio timelines remain gapless through repeated pauses |
 | Fragmented/crash-safe output | Missing | Kill mid-write, playable fragments, normal finalization |
 | Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
 | Synthetic video + tone E2E | Passed on macOS CI | Encoded movies + complete decoder probe saved as CI artifacts |
+| Synthetic flash/beep sync, mixer and track layouts | Added; awaiting macOS CI | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
 
 ## Replay and live output
 
@@ -42,6 +44,7 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Scene presets and switching | Missing | Screen, screen+cam and camera switching without stopping |
 | Floating camera layout controls | Missing | Drag/snap, circle/rounded/square/pill/squircle, border/shadow |
 | Audio meters | Missing | Per-source peak meters, no render work while hidden |
+| CLI recording status | Implemented (TTY only) | Elapsed time and drops visible while recording |
 | Menu bar and Dock behavior | Missing | Start/pause/stop/save/quit, finalized file on exit |
 | Global hotkeys | Missing | Registered/unregistered safely, conflicts visible |
 | Settings persistence | Missing | No recording corruption on invalid/stale settings |
