@@ -11,7 +11,14 @@
 #include <string_view>
 #include <thread>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <io.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -22,7 +29,7 @@ std::atomic_bool interrupted{false};
 extern "C" void on_signal(int) { interrupted.store(true); }
 
 void usage() {
-    std::cout << "rec: native macOS screen recorder\n\n"
+    std::cout << "rec: native screen recorder for macOS and Windows\n\n"
                  "Usage:\n"
                  "  rec devices\n"
                  "  rec record [options]\n"
@@ -148,6 +155,14 @@ void show_status(const rec::Stats& stats, std::chrono::steady_clock::duration el
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // UTF-8 output and ANSI colors for the status line.
+    SetConsoleOutputCP(CP_UTF8);
+    if (HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE); out != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(out, &mode)) SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+#endif
     if (argc == 1 || std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h") {
         usage(); return 0;
     }

@@ -27,7 +27,7 @@ within() {
     || { echo "$1 is outside [$2, $3]" >&2; exit 1; }
 }
 
-"$rec" --help | grep -q 'native macOS screen recorder'
+"$rec" --help | grep -q 'native screen recorder'
 expect_failure 'fps must be' record --fps invalid
 expect_failure 'resolution must be' record --resolution gigantic
 expect_failure 'requires --test-pattern' record --test-tone

@@ -2,18 +2,20 @@
 
 ## Scope
 
-Build a compact macOS recorder. Keep the recording engine usable from C++ without the CLI or a GUI. The current implementation captures one display, system audio and a microphone with ScreenCaptureKit and writes H.264 or HEVC video plus AAC audio (a mix and per-source stems) with AVAssetWriter. The product goal is full feature parity with rec-rs, including audio, camera, scenes, replay, streaming, and a native UI. Track implemented, verified, and missing behavior separately in `docs/parity.md`. Do not imply parity from a compiled interface.
+Build a compact recorder for macOS (primary) and Windows. Keep the recording engine usable from C++ without the CLI or a GUI. On macOS the current implementation captures one display, system audio and a microphone with ScreenCaptureKit and writes H.264 or HEVC video plus AAC audio (a mix and per-source stems) with AVAssetWriter. On Windows the same engine contract uses Windows.Graphics.Capture, Direct3D 11, WASAPI and the Media Foundation sink writer. The product goal is full feature parity with rec-rs, including audio, camera, scenes, replay, streaming, and a native UI. Track implemented, verified, and missing behavior separately in `docs/parity.md`. Do not imply parity from a compiled interface.
 
 ## Decisions
 
-- Use C++20. Limit Objective-C++ to Apple framework adapters in `src/platform/macos/`.
+- Use C++20. Limit Objective-C++ to Apple framework adapters in `src/platform/macos/`. Windows code uses C++/WinRT only for capture interop in `src/platform/windows/`.
+- Platform-neutral audio logic (mixer, limiter, synthetic sources, flash/beep sync analysis) lives in `src/core/` and is shared by both engines.
 - The public object API is `rec::Recorder` with `start()`, `stop()`, `finished()`, `stats()`, and `failure()`. The CLI calls the same API.
 - Keep capture callbacks free of encoding, blocking I/O, and allocations except retaining the delivered buffer.
-- Stamp every source on the host clock. Video is written on an exact 1/fps grid, emitted 40 ms behind real time so each slot uses the frame that was on screen at that instant. The engine holds at most three pending surfaces plus the current one (SCK `queueDepth` 6). Use VideoToolbox via AVAssetWriter.
+- Stamp every source on the host clock (mach time on macOS, QPC on Windows). Video is written on an exact 1/fps grid, emitted 40 ms behind real time so each slot uses the frame that was on screen at that instant. The engine holds at most three pending surfaces plus the current one (SCK `queueDepth` 6; on Windows five NV12 slots and a two-buffer WGC pool). Use VideoToolbox via AVAssetWriter on macOS and the hardware Media Foundation encoder on the GPU that drives the captured monitor on Windows.
 - Audio sources use fixed 16-buffer queues that drop the oldest on overflow. The recording thread drains them, including while it waits for video backpressure, because AVAssetWriter interleaves inputs. The mixer owns a 2-second timeline and is allocated only when two sources are mixed. Add other queues only for a demonstrated need, with explicit size and overload behavior.
-- Expose errors at the API boundary. No exceptions across the Apple callback boundary.
-- Prefer Apple frameworks and the C++ standard library. Do not add FFmpeg, Qt, Electron, or a plugin framework by default.
-- Verify end-to-end output files on macOS before claiming recording quality or performance. Linux builds exercise the CLI and unsupported-platform contract only.
+- Expose errors at the API boundary. No exceptions across the Apple callback boundary or out of WinRT event handlers.
+- Windows loopback delivers no packets while nothing plays, and the MP4 sink holds video until audio catches up. The engine plays silence on the output endpoint during system-audio capture to keep the audio clock moving. The MP4 sink also stores tracks in reverse `AddStream` order; streams are added microphone stem, system stem, mix, video.
+- Prefer the platform media frameworks and the C++ standard library. Do not add FFmpeg, Qt, Electron, or a plugin framework by default.
+- Verify end-to-end output files on each platform before claiming recording quality or performance there. Linux builds exercise the CLI and unsupported-platform contract only.
 - Do not write unit tests. Use end-to-end capture and output verification for behavior; retain output recordings and probe results as reproducible CI artifacts.
 - Keep benchmarks reproducible: same machine, same screen content, codec, output frame rate, resolution, and recording duration. Include encoder backpressure and memory samples.
 - Add an abstraction only when a concrete second implementation needs it.
@@ -41,7 +43,9 @@ These are references, not dependencies. Record the upstream revision when copyin
 
 - `include/rec/`: public C++ API.
 - `src/`: command-line frontend.
+- `src/core/`: platform-neutral mixer and sync analysis shared by the engines.
 - `src/platform/macos/`: Apple capture, timing and encoding adapter.
-- `src/platform/unsupported.cpp`: clear error on non-macOS hosts.
-- `scripts/`: build and end-to-end smoke runs.
-- `.github/workflows/`: native macOS build and capture-independent smoke gate.
+- `src/platform/windows/`: Windows capture (WGC, WASAPI), timing and Media Foundation encoding adapter.
+- `src/platform/unsupported.cpp`: clear error on other hosts.
+- `scripts/`: build and end-to-end runs (`*.sh` for macOS, `*.ps1` for Windows).
+- `.github/workflows/`: native macOS and Windows builds and capture-independent smoke gates.

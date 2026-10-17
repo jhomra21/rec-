@@ -8,6 +8,8 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 #include "rec/rec.hpp"
+#include "core/mixer.hpp"
+#include "core/sync.hpp"
 
 #include <algorithm>
 #include <array>
@@ -54,8 +56,7 @@ void receive_failure(void* owner, NSError* error);
 
 namespace rec {
 namespace {
-constexpr std::int32_t kMixRate = 48000;
-constexpr double kTwoPi = 6.283185307179586;
+using core::kMixRate;
 // Video is emitted this far behind real time, so the frame that was on screen at each
 // slot instant has already been delivered. ScreenCaptureKit delivers frames a few
 // milliseconds after their presentation timestamps.
@@ -384,61 +385,6 @@ private:
     std::array<Frame, 3> items_{};
     std::size_t head_ = 0;
     std::size_t count_ = 0;
-};
-
-// Sums sources on a 48 kHz timeline whose sample 0 is the recording origin, then
-// limits the result below -1 dBFS instead of clipping. Not thread-safe; the recording
-// thread owns it.
-class Mixer {
-public:
-    void reset(std::size_t capacity) {
-        buffer_.assign(capacity * 2, 0.0f);
-        capacity_ = static_cast<std::int64_t>(capacity);
-        emitted_ = 0;
-        ends_ = {0, 0};
-        gain_ = 1;
-    }
-    std::int64_t emitted() const { return emitted_; }
-    std::int64_t capacity() const { return capacity_; }
-    std::int64_t end(std::size_t source) const { return ends_[source]; }
-
-    // Frames before the emitted point or beyond the window are discarded.
-    void add(std::size_t source, std::int64_t start, const float* stereo, std::size_t frames, float gain) {
-        const auto stop = start + static_cast<std::int64_t>(frames);
-        ends_[source] = std::max(ends_[source], stop);
-        const auto first = std::max(start, emitted_);
-        const auto last = std::min(stop, emitted_ + capacity_);
-        for (auto i = first; i < last; ++i) {
-            const auto slot = static_cast<std::size_t>(i % capacity_) * 2;
-            const auto from = static_cast<std::size_t>(i - start) * 2;
-            buffer_[slot] += stereo[from] * gain;
-            buffer_[slot + 1] += stereo[from + 1] * gain;
-        }
-    }
-
-    void take(std::size_t frames, std::vector<float>& out) {
-        out.resize(frames * 2);
-        for (std::size_t i = 0; i < frames; ++i) {
-            const auto slot = static_cast<std::size_t>((emitted_ + static_cast<std::int64_t>(i)) % capacity_) * 2;
-            const float left = buffer_[slot], right = buffer_[slot + 1];
-            const float peak = std::max(std::fabs(left), std::fabs(right));
-            const float needed = peak > kCeiling ? kCeiling / peak : 1.0f;
-            gain_ = needed < gain_ ? needed : std::min(needed, gain_ + (1.0f - gain_) * kRelease);
-            out[i * 2] = left * gain_;
-            out[i * 2 + 1] = right * gain_;
-            buffer_[slot] = buffer_[slot + 1] = 0;
-        }
-        emitted_ += static_cast<std::int64_t>(frames);
-    }
-
-private:
-    static constexpr float kCeiling = 0.891f;  // -1 dBFS
-    static constexpr float kRelease = 1.0f / (0.05f * kMixRate);  // About 50 ms back to unity.
-    std::vector<float> buffer_;
-    std::int64_t capacity_ = 1;
-    std::int64_t emitted_ = 0;
-    std::array<std::int64_t, 2> ends_{};
-    float gain_ = 1;
 };
 
 enum Source : std::size_t { kSystem = 0, kMic = 1 };
@@ -820,10 +766,7 @@ private:
     // The frame on screen at the slot's instant: the newest delivered frame whose
     // timestamp is not after it. Runs on the recording thread, which owns current_.
     CVPixelBufferRef select_frame(std::uint64_t slot) {
-        if (options_.test_pattern) {
-            const auto flash_slots = std::max<std::uint64_t>(1, options_.fps / 10);
-            return pattern_[slot % options_.fps < flash_slots ? 1 : 0];
-        }
+        if (options_.test_pattern) return pattern_[core::test_flash(slot, options_.fps) ? 1 : 0];
         const CMTime due = CMTimeAdd(host_origin_, CMTimeMake(static_cast<int64_t>(slot),
                                                              static_cast<int32_t>(options_.fps)));
         std::lock_guard lock(mutex_);
@@ -981,20 +924,15 @@ private:
             const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(1024, until - synthetic_samples_));
             const CMTime pts = CMTimeAdd(host_origin_, CMTimeMake(static_cast<int64_t>(synthetic_samples_), kMixRate));
             if (options_.test_tone) {
-                for (std::size_t i = 0; i < count; ++i) {
-                    const auto index = (synthetic_samples_ + i) % kMixRate;
-                    const double phase = kTwoPi * 440.0 * static_cast<double>(index) / kMixRate;
-                    const auto value = static_cast<std::int16_t>(index < kMixRate / 10 ? std::sin(phase) * 8000.0 : 0.0);
-                    tone[i * 2] = tone[i * 2 + 1] = value;
-                }
+                for (std::size_t i = 0; i < count; ++i)
+                    tone[i * 2] = tone[i * 2 + 1] =
+                        static_cast<std::int16_t>(core::test_tone(synthetic_samples_ + i) * 32768.0f);
                 if (!submit_synthetic(kSystem, pcm_buffer(tone_format_, tone.data(), count * 4, count, pts)))
                     return false;
             }
             if (options_.test_mic) {
-                for (std::size_t i = 0; i < count; ++i) {
-                    const double phase = kTwoPi * 1000.0 * static_cast<double>(synthetic_samples_ + i) / kMixRate;
-                    mic[i] = static_cast<std::int16_t>(std::sin(phase) * 300.0);
-                }
+                for (std::size_t i = 0; i < count; ++i)
+                    mic[i] = static_cast<std::int16_t>(core::test_mic(synthetic_samples_ + i) * 32768.0f);
                 if (!submit_synthetic(kMic, pcm_buffer(mic_tone_format_, mic.data(), count * 2, count, pts)))
                     return false;
             }
@@ -1071,7 +1009,7 @@ private:
     std::array<AudioSource, 2> audio_;
     double system_offset_ms_ = 0;
     bool mixing_ = false;
-    Mixer mixer_;
+    core::Mixer mixer_;
     AVAssetWriterInput* __strong mix_input_ = nil;
     std::vector<float> pcm_, mixed_;
     std::vector<std::byte> scratch_;
@@ -1139,8 +1077,7 @@ Result probe_file(const std::string& path, Probe& probe) {
         [reader addOutput:output];
         if (![reader startReading]) return {message(reader.error, "video decode start failed")};
         CMTime previous = kCMTimeInvalid;
-        std::vector<double> flashes;
-        bool bright = false;
+        core::FlashDetector flashes;
         while (CMSampleBufferRef sample = [output copyNextSampleBuffer]) {
             const CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sample);
             if (CMTIME_IS_VALID(previous) && CMTimeCompare(timestamp, previous) <= 0) {
@@ -1150,9 +1087,7 @@ Result probe_file(const std::string& path, Probe& probe) {
             }
             previous = timestamp;
             ++probe.frames;
-            const bool now_bright = brightness(CMSampleBufferGetImageBuffer(sample)) > 0.8;
-            if (now_bright && !bright) flashes.push_back(CMTimeGetSeconds(timestamp));
-            bright = now_bright;
+            flashes.feed(CMTimeGetSeconds(timestamp), brightness(CMSampleBufferGetImageBuffer(sample)));
             CFRelease(sample);
         }
         if (reader.status != AVAssetReaderStatusCompleted)
@@ -1163,7 +1098,7 @@ Result probe_file(const std::string& path, Probe& probe) {
         NSArray<AVAssetTrack*>* audio_tracks = [asset tracksWithMediaType:AVMediaTypeAudio];
         probe.audio_tracks = static_cast<std::uint32_t>(audio_tracks.count);
         AVAssetTrack* audio = audio_tracks.firstObject;
-        std::vector<double> beeps;
+        core::OnsetDetector beeps;
         if (audio) {
             CMFormatDescriptionRef audio_format =
                 (__bridge CMFormatDescriptionRef)audio.formatDescriptions.firstObject;
@@ -1185,7 +1120,6 @@ Result probe_file(const std::string& path, Probe& probe) {
             [audio_reader addOutput:audio_output];
             if (![audio_reader startReading]) return {message(audio_reader.error, "audio decode start failed")};
             std::vector<float> samples;
-            double last_loud = -1e9;
             while (CMSampleBufferRef buffer = [audio_output copyNextSampleBuffer]) {
                 ++probe.audio_buffers;
                 const auto* description =
@@ -1202,11 +1136,7 @@ Result probe_file(const std::string& path, Probe& probe) {
                             float peak = 0;
                             for (UInt32 c = 0; c < channels; ++c)
                                 peak = std::max(peak, std::fabs(samples[frame * channels + c]));
-                            if (peak < 0.1f) continue;
-                            // An onset is the first loud sample after at least 200 ms without one.
-                            const double t = start + static_cast<double>(frame) / description->mSampleRate;
-                            if (t - last_loud >= 0.2) beeps.push_back(t);
-                            last_loud = t;
+                            beeps.feed(start + static_cast<double>(frame) / description->mSampleRate, peak);
                         }
                     }
                 }
@@ -1217,17 +1147,7 @@ Result probe_file(const std::string& path, Probe& probe) {
             if (!probe.audio_buffers) return {"audio track has no decoded samples"};
         }
 
-        double total = 0;
-        for (const double flash : flashes) {
-            double best = 1e9;
-            for (const double beep : beeps)
-                if (std::fabs(beep - flash) < std::fabs(best)) best = beep - flash;
-            if (std::fabs(best) > 0.5) continue;
-            ++probe.sync_events;
-            total += best * 1000.0;
-            probe.av_offset_max_ms = std::max(probe.av_offset_max_ms, std::fabs(best) * 1000.0);
-        }
-        if (probe.sync_events) probe.av_offset_ms = total / probe.sync_events;
+        core::measure_sync(flashes.onsets, beeps.onsets, probe);
         return {};
     }
 }
