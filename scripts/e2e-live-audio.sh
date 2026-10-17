@@ -3,6 +3,8 @@
 # A full-screen window flashes white with a simultaneous beep once a second while rec
 # records the display and system audio; rec probe then measures the offset in the file.
 # REC_E2E_MIC=1 also records the default microphone (mix + stems).
+# REC_E2E_PAUSE=1 pauses for 2 s in the middle of the stimulus: the movie must keep its
+# full length and stay in sync across the cut.
 set -euo pipefail
 
 [[ "$(uname -s)" == Darwin ]] || { echo 'live A/V sync E2E requires macOS' >&2; exit 1; }
@@ -30,8 +32,14 @@ if [[ "${REC_E2E_MIC:-0}" == 1 ]]; then args+=(--mic default); fi
 
 echo "Saving recordings and evidence to: $artifacts"
 "$rec" devices | tee "$artifacts/devices.txt"
-"$rec" "${args[@]}" >"$artifacts/record.log" 2>&1 &
+# rec reads pause/resume commands from stdin. The FIFO stays open on fd 3 until the end so
+# rec never sees end of input early.
+control="$artifacts/control"
+rm -f "$control"
+mkfifo "$control"
+"$rec" "${args[@]}" <"$control" >"$artifacts/record.log" 2>&1 &
 capture_pid="$!"
+exec 3>"$control"
 
 # Allow the recorder to establish its screen/audio stream and first video frame.
 sleep 3
@@ -42,15 +50,30 @@ if ! kill -0 "$capture_pid" 2>/dev/null; then
 fi
 
 # Separate process: ScreenCaptureKit excludes only rec's own audio.
-"$artifacts/flash-beep" 6 >"$artifacts/stimulus.log" 2>&1
+if [[ "${REC_E2E_PAUSE:-0}" == 1 ]]; then
+  "$artifacts/flash-beep" 8 >"$artifacts/stimulus.log" 2>&1 &
+  stimulus_pid="$!"
+  sleep 3.5
+  echo pause >&3
+  sleep 2
+  echo resume >&3
+  wait "$stimulus_pid"
+else
+  "$artifacts/flash-beep" 6 >"$artifacts/stimulus.log" 2>&1
+fi
 wait "$capture_pid" || { echo "Recorder failed; see $artifacts/record.log" >&2; exit 1; }
 capture_pid=""
+exec 3>&-
+rm -f "$control"
 
 "$rec" probe "$artifacts/recording.mov" | tee "$artifacts/recording.probe"
 value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$artifacts/recording.probe"; }
 grep -qx 'codec=h264' "$artifacts/recording.probe"
 grep -qx 'audio_codec=aac' "$artifacts/recording.probe"
+grep -qx 'frames=720' "$artifacts/recording.probe"
+awk -v d="$(value audio_duration)" 'BEGIN { exit !(d >= 11.9 && d <= 12.1) }' || { echo "audio lasts $(value audio_duration) s, not 12 s" >&2; exit 1; }
 if [[ "${REC_E2E_MIC:-0}" == 1 ]]; then grep -qx 'audio_tracks=3' "$artifacts/recording.probe"; fi
+if [[ "${REC_E2E_PAUSE:-0}" == 1 ]]; then grep -q 'not in the movie' "$artifacts/record.log"; fi
 events="$(value av_sync_events)"
 offset="$(value av_offset_ms)"
 worst="$(value av_offset_max_ms)"
