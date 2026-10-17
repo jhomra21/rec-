@@ -30,10 +30,10 @@ Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living 
 | Capability | State | Required acceptance |
 | --- | --- | --- |
 | Replay buffer (15–300 s) | Missing | Keyframe-safe save without stopping the capture |
-| RTMP and RTMPS | Missing | Authentication, reconnect, 4K stream, keyframe timing |
+| RTMP and RTMPS | RTMP implemented on Windows: rec's own client (handshake, AMF0, chunking, FLV H.264/AAC), `--stream`. Verified against MediaMTX v1.21.2, which records what it receives. Synthetic (CI and local): 119/120 frames received, 4 pairs, worst 10.8 ms; mix sent with a stems-only file; silent AAC without audio sources; killing the server keeps the recording. Live with hardware H.264: 719/720 frames received, 7 pairs, worst 21.9 ms (`REC_E2E_STREAM=1`). RTMPS, reconnect and macOS missing | Twitch/YouTube ingest, RTMPS, reconnect, 4K stream, slow-network keyframe skipping, long pauses |
 | WHIP/WebRTC | Missing | Server handshake, ICE/DTLS/SRTP, A/V sync, cleanup |
-| Shared live encoder | Missing | Replay and simultaneous streams share one encode |
-| Stream keys in Keychain | Missing | No keys in logs/settings, revoke and replace |
+| Shared live encoder | Partial on Windows: one stream encoder (H.264 + AAC) beside the file encoder, fed the same frames and program audio. No replay buffer or second stream uses it yet | Replay and simultaneous streams share one encode |
+| Stream keys in Keychain | Missing. The CLI prints `rtmp://host/app/****` and smoke checks that the key is not printed, but the key is visible in the process arguments | No keys in logs/settings, revoke and replace |
 | Capture survives GUI close | Missing | Recording, replay and streams continue headless |
 
 ## Application experience

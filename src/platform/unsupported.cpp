@@ -22,4 +22,5 @@ bool Recorder::running() const noexcept { return false; }
 bool Recorder::finished() const noexcept { return true; }
 Stats Recorder::stats() const noexcept { return {}; }
 std::string Recorder::failure() const { return {}; }
+std::string Recorder::stream_failure() const { return {}; }
 } // namespace rec

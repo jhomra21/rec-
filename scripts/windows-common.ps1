@@ -89,3 +89,69 @@ function Stop-RecProcess($run, [int]$timeoutSeconds = 60) {
     $run.Process.WaitForExit()
     return @{ Code = $run.Process.ExitCode; Text = ($run.Stdout.Result + $run.Stderr.Result).Trim() }
 }
+
+# MediaMTX, a local RTMP server for the streaming E2E: pinned release, checksum-verified.
+$MediaMtxVersion = 'v1.21.2'
+$MediaMtxSha256 = 'a84224f5a490855684e62ba6fb71e80ea2a5e16aed61883bb58380290e93e467'
+
+function Get-MediaMTX([string]$cache) {
+    $dir = Join-Path $cache "mediamtx-$MediaMtxVersion"
+    $exe = Join-Path $dir 'mediamtx.exe'
+    if (Test-Path $exe) { return $exe }
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $zip = Join-Path $dir 'mediamtx.zip'
+    $url = "https://github.com/bluenviron/mediamtx/releases/download/$MediaMtxVersion/mediamtx_$($MediaMtxVersion)_windows_amd64.zip"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+    $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+    if ($hash -ne $MediaMtxSha256) { Remove-Item $zip; throw "MediaMTX download checksum mismatch: $hash" }
+    Expand-Archive -Path $zip -DestinationPath $dir -Force
+    Remove-Item $zip
+    return $exe
+}
+
+# Starts MediaMTX on 127.0.0.1:1935 with RTMP only, recording every published stream as
+# fragmented MP4 under $recordings.
+function Start-MediaMTX([string]$exe, [string]$recordings, [string]$work) {
+    New-Item -ItemType Directory -Force $recordings, $work | Out-Null
+    $config = Join-Path $work 'mediamtx.yml'
+    $target = ($recordings -replace '\\', '/') + '/%path/%Y-%m-%d_%H-%M-%S-%f'
+    Set-Content -Path $config -Encoding ASCII -Value @"
+logLevel: info
+api: no
+metrics: no
+pprof: no
+playback: no
+rtsp: no
+rtmp: yes
+rtmpAddress: 127.0.0.1:1935
+hls: no
+webrtc: no
+srt: no
+moq: no
+pathDefaults:
+  record: yes
+  recordPath: $target
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+paths:
+  all_others:
+"@
+    $log = Join-Path $work 'mediamtx.log'
+    $process = Start-Process -FilePath $exe -ArgumentList "`"$config`"" -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $log -RedirectStandardError (Join-Path $work 'mediamtx.err.log')
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        if ($process.HasExited) { throw "MediaMTX exited: $(Get-Content -Raw $log)" }
+        $client = New-Object Net.Sockets.TcpClient
+        try { $client.Connect('127.0.0.1', 1935); return @{ Process = $process; Log = $log } } catch { Start-Sleep -Milliseconds 200 } finally { $client.Dispose() }
+    }
+    $process.Kill()
+    throw 'MediaMTX did not open 127.0.0.1:1935'
+}
+
+function Stop-MediaMTX($server) {
+    if (-not $server.Process.HasExited) { $server.Process.Kill(); $server.Process.WaitForExit() }
+}

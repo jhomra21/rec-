@@ -33,6 +33,7 @@
 #include "core/mixer.hpp"
 #include "core/pause.hpp"
 #include "core/sync.hpp"
+#include "platform/windows/stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -631,6 +632,22 @@ public:
             if (auto opened = open_audio(); !opened) { stop(); return opened; }
             if (auto started = start_capture(); !started) { stop(); return started; }
         }
+        if (!options_.stream_url.empty()) {
+            if (options_.stream_kbps < 500 || options_.stream_kbps > 50000) {
+                stop();
+                return {"stream bitrate must be between 500 and 50000 kb/s"};
+            }
+            win::LiveSettings live;
+            live.url = options_.stream_url;
+            live.width = size_.width;
+            live.height = size_.height;
+            live.fps = options_.fps;
+            live.video_kbps = options_.stream_kbps;
+            live.manager = manager_.Get();
+            live.vendor = vendor_;
+            live_ = std::make_unique<win::LiveStream>();
+            if (auto started = live_->start(live); !started) { stop(); return {"stream: " + started.error}; }
+        }
         active_.store(true);
         if (auto ready = create_writer(); !ready) { stop(); return ready; }
         finished_.store(false);
@@ -679,6 +696,7 @@ public:
             writing_ = false;
             writer_.Reset();
         }
+        if (live_) live_->stop();
         if (allocator_) { allocator_->UninitializeSampleAllocator(); allocator_.Reset(); }
         for (auto& slot : slots_) slot = {};
         pending_count_ = 0;
@@ -718,9 +736,18 @@ public:
         stats.system_audio_offset_ms = audio_[kSystem].enabled ? system_offset_ms_ : 0;
         stats.paused = timeline_.paused();
         stats.paused_seconds = static_cast<double>(timeline_.paused_total(now_ticks())) / kTicks;
+        if (live_) {
+            const auto live = live_->counters();
+            stats.streaming = live.live;
+            stats.stream_hardware = live.hardware;
+            stats.stream_frames = live.frames;
+            stats.stream_dropped = live.dropped;
+            stats.stream_bytes = live.bytes;
+        }
         return stats;
     }
     std::string failure() const { std::lock_guard lock(mutex_); return failure_; }
+    std::string stream_failure() const { return live_ ? live_->failure() : std::string(); }
 
     Result pause() {
         if (!recording_.load() || finished_.load()) return {"not recording"};
@@ -778,6 +805,8 @@ private:
         // Capture, scale, and encode on the GPU that scans out the monitor, so frames never
         // cross adapters on hybrid systems.
         const auto adapter = adapter_for(monitor.handle);
+        DXGI_ADAPTER_DESC1 adapter_desc{};
+        if (adapter && SUCCEEDED(adapter->GetDesc1(&adapter_desc))) vendor_ = adapter_desc.VendorId;
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         HRESULT hr = D3D11CreateDevice(adapter.Get(), adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -1004,8 +1033,10 @@ private:
         // system stem, mix, then video, so the file reads video, mix (the default audio
         // track players pick), system, microphone.
         const bool system = audio_[kSystem].enabled, mic = audio_[kMic].enabled;
-        mixing_ = system && mic && options_.audio_tracks != AudioTracks::stems;
-        const bool stems = !mixing_ || options_.audio_tracks == AudioTracks::both;
+        const bool file_mix = system && mic && options_.audio_tracks != AudioTracks::stems;
+        // A stream always carries the mix, even when the file keeps only stems.
+        mixing_ = file_mix || (system && mic && live_);
+        const bool stems = !file_mix || options_.audio_tracks == AudioTracks::both;
         auto add_audio = [&](std::uint32_t channels, std::uint32_t bytes_per_second, int& index) -> Result {
             DWORD added = 0;
             HRESULT result = writer_->AddStream(audio_type(MFAudioFormat_AAC, channels, bytes_per_second).Get(), &added);
@@ -1022,10 +1053,10 @@ private:
         if (system && stems) {
             if (auto added = add_audio(2, 24000, audio_[kSystem].stream); !added) return added;
         }
-        if (mixing_) {
+        if (file_mix) {
             if (auto added = add_audio(2, 24000, mix_stream_); !added) return added;
-            mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
         }
+        if (mixing_) mixer_.reset(static_cast<std::size_t>(kMixRate) * 2);
 
         const std::uint32_t bitrate = (options_.bitrate_mbps ? options_.bitrate_mbps
             : (size_.height > 1440 ? 50u : size_.height > 1080 ? 30u : 20u)) * 1000000u;
@@ -1052,7 +1083,8 @@ private:
             ComPtr<IMFAttributes> pool;
             MFCreateAttributes(&pool, 1);
             pool->SetUINT32(MF_SA_D3D11_BINDFLAGS, D3D11_BIND_RENDER_TARGET);
-            if (SUCCEEDED(hr)) hr = allocator_->InitializeSampleAllocatorEx(2, 8, pool.Get(), input.Get());
+            // The stream encoder holds frames too.
+            if (SUCCEEDED(hr)) hr = allocator_->InitializeSampleAllocatorEx(2, live_ ? 16 : 8, pool.Get(), input.Get());
             if (FAILED(hr)) return {failed("could not allocate encoder frames", hr)};
         }
         hr = writer_->BeginWriting();
@@ -1094,6 +1126,7 @@ private:
         sample->SetSampleDuration(kTicks / options_.fps);
         const HRESULT hr = writer_->WriteSample(video_stream_, sample.Get());
         if (FAILED(hr)) { fail(failed("video encoding failed", hr)); return Write::failed; }
+        if (live_) live_->video(sample.Get());
         return Write::done;
     }
 
@@ -1152,6 +1185,7 @@ private:
             ok = ok && write_pcm(source.stream, data, frames, source.stem_channels, start);
         }
         if (mixing_) mixer_.add(kind, start, data, frames, source.gain);
+        else if (live_) live_->audio(start, data, frames);
         source.next = start + static_cast<std::int64_t>(frames);
         if (ok) source.written.fetch_add(1);
         else source.dropped.fetch_add(1);
@@ -1173,7 +1207,7 @@ private:
     }
 
     void emit_mix(bool flush) {
-        if (!mixing_ || mix_stream_ < 0) return;
+        if (!mixing_) return;
         std::int64_t target = flush ? video_end_samples() : std::min(mixer_.end(kSystem), mixer_.end(kMic));
         if (!flush && !options_.test_pattern)
             target = std::max(target, timeline_.to_output(now_ticks()).output * kMixRate / kTicks - kMixWaitFrames);
@@ -1182,6 +1216,8 @@ private:
             const auto first = mixer_.emitted();
             const auto frames = static_cast<std::size_t>(std::min<std::int64_t>({target - first, 4800, mixer_.capacity()}));
             mixer_.take(frames, mixed_);
+            if (live_) live_->audio(first, mixed_.data(), frames);
+            if (mix_stream_ < 0) continue;
             if (!write_pcm(mix_stream_, mixed_.data(), frames, 2, first)) return;
             mix_written_.fetch_add(1);
         }
@@ -1274,6 +1310,9 @@ private:
                 video_end_slot_ = slot + 1;
                 if (options_.test_tone || options_.test_mic)
                     write_synthetic_audio(((slot + 1) * static_cast<std::uint64_t>(kMixRate)) / options_.fps);
+                // A stream without audio sources still carries a silent AAC track; services expect one.
+                if (live_ && !audio_[kSystem].enabled && !audio_[kMic].enabled)
+                    live_->audio(0, nullptr, static_cast<std::size_t>(video_end_samples()));
             } else if (!stop_requested_.load() && !finished_.load()) {
                 dropped_.fetch_add(1);
             }
@@ -1319,6 +1358,8 @@ private:
 
     ComPtr<IMFSinkWriter> writer_;
     DWORD video_stream_ = 0;
+    std::unique_ptr<win::LiveStream> live_;  // Kept after stop() for its counters.
+    std::uint32_t vendor_ = 0;
     int mix_stream_ = -1;
     std::array<AudioSource, 2> audio_;
     double system_offset_ms_ = 0;
@@ -1500,5 +1541,6 @@ bool Recorder::running() const noexcept { return impl_->capture.running(); }
 bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
 Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }
 std::string Recorder::failure() const { return impl_->capture.failure(); }
+std::string Recorder::stream_failure() const { return impl_->capture.stream_failure(); }
 
 } // namespace rec

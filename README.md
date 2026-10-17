@@ -2,7 +2,7 @@
 
 A compact screen recorder for macOS and Windows, built with C++20 and each platform's native capture and hardware encoding frameworks.
 
-Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone passes the flash/beep sync test on a Mac (M3 Pro) and on a Windows PC; see the Mac evidence ([run 1](docs/evidence/2026-10-16-live-test/README.md), [run 2](docs/evidence/2026-10-16-run2/README.md), [run 3](docs/evidence/2026-10-16-run3/README.md), [run 4: pause and crash safety](docs/evidence/2026-10-17-run4/README.md)) and the Windows measurements below. Recordings can be paused and resumed, and a crash leaves a playable file. Camera overlays, window selection, replay and streaming are not implemented.
+Full feature parity with [rec-rs](https://github.com/michaelshimeles/rec-rs) is the goal; the current implementation is intentionally narrower. It records one display to a `.mov` or `.mp4` file with H.264 or HEVC, with optional system audio (`--system-audio`) and microphone (`--mic`). Both audio sources are recorded together as a mix track plus a separate track for each source. The synthetic flash-and-beep path is verified in CI on both platforms. Live capture with system audio and a microphone passes the flash/beep sync test on a Mac (M3 Pro) and on a Windows PC; see the Mac evidence ([run 1](docs/evidence/2026-10-16-live-test/README.md), [run 2](docs/evidence/2026-10-16-run2/README.md), [run 3](docs/evidence/2026-10-16-run3/README.md), [run 4: pause and crash safety](docs/evidence/2026-10-17-run4/README.md)) and the Windows measurements below. Recordings can be paused and resumed, and a crash leaves a playable file. On Windows a recording can also be streamed live over RTMP. Camera overlays, window selection, replay, and streaming on macOS are not implemented.
 
 ## Build
 
@@ -50,6 +50,19 @@ While recording in a terminal, press `p` or space to pause and resume, and `q` o
 
 Recordings are written in fragments, so a crash, kill or power loss keeps everything up to the last fragment (about 1 s on macOS). On macOS a normal stop turns the fragments into a regular movie. On Windows, H.264 files stay fragmented MP4, which players read normally. Windows HEVC uses the regular MP4 writer and is **not** crash-safe, because Windows' fragmented MP4 writer rejects HEVC.
 
+### Live streaming (Windows)
+
+```powershell
+.\build\Release\rec.exe record --system-audio --mic default --stream rtmp://live.twitch.tv/app/YOUR_KEY -t 0 -o show.mp4
+```
+
+`--stream URL` sends the recording timeline to an RTMP server (Twitch, YouTube, OBS-style ingest, MediaMTX) while the file records. The stream has its own encoders, so the file keeps its quality: H.264 at `--stream-bitrate` kb/s (default 6000, constant bitrate, keyframe every 2 s, no B-frames) on the hardware encoder of the display's GPU when there is one, and 160 kb/s AAC stereo. The stream carries the mix when both system audio and a microphone are recorded (even with `--audio-tracks stems`), the single source otherwise, and a silent track when there is no audio, because services expect one.
+
+- rec prints the URL as `rtmp://host/app/****` and never prints the key. The key is still visible to other local users in the process list; secure key storage is future work.
+- If the network falls behind by about 3 s, rec skips video until the next keyframe instead of building up delay. The status line shows LIVE and any skipped frames.
+- If the connection drops, the recording continues. rec saves the file, prints `Stream stopped early: ...` and exits with status 1.
+- Paused time is cut from the stream too. The server receives nothing while paused and may time out a long pause.
+- RTMPS, reconnecting, and streaming on macOS are not implemented yet.
 `rec::Recorder` in `include/rec/rec.hpp` is the public library API. The CLI uses the same engine. IOSurface-backed pixel buffers go to AVAssetWriter without CPU pixel copying. It uses ScreenCaptureKit for resizing in this initial version.
 
 ## Audio and sync
@@ -91,7 +104,9 @@ REC_E2E_PAUSE=1 bash scripts/e2e-live-audio.sh # pause 2 s mid-stimulus; the mov
 
 The script compiles `scripts/flash-beep.swift`, which flashes a full-screen window white with a simultaneous beep once a second. It records the display and system audio, probes the movie, and fails if fewer than four flash/beep pairs are found or if the mean offset falls outside the ITU-R BT.1359 detectability window (audio up to 45 ms early or 125 ms late). The movie, logs and probe report stay in the printed evidence directory.
 
-On Windows the equivalent is `scripts/e2e-live-audio.ps1` (set `$env:REC_E2E_MIC='1'` to add the microphone). Its stimulus, `scripts/flash-beep.ps1`, drives the flash from the audio device's play position.
+On Windows the equivalent is `scripts/e2e-live-audio.ps1` (set `$env:REC_E2E_MIC='1'` to add the microphone). Its stimulus, `scripts/flash-beep.ps1`, drives the flash from the audio device's play position. `$env:REC_E2E_STREAM='1'` also streams the recording to a local MediaMTX server and checks the flash/beep sync of what the server received. A system dialog that dims the screen (such as a firewall prompt) makes the flashes too dark to detect, so close any open dialog first.
+
+Streaming tests use [MediaMTX](https://github.com/bluenviron/mediamtx) v1.21.2 as the receiving server. `windows-common.ps1` downloads it once into `build/tools`, checks its SHA-256, and runs it with only RTMP enabled on 127.0.0.1. MediaMTX records what it receives as fragmented MP4, and `rec probe` checks that file.
 
 ```sh
 ./scripts/smoke.sh
@@ -103,7 +118,7 @@ REC_E2E_CAPTURE=1 ./scripts/smoke.sh
 $env:REC_E2E_CAPTURE='1'; .\scripts\smoke.ps1    # also a real display capture
 ```
 
-The first command builds, encodes real synthetic H.264 and HEVC movies through VideoToolbox, and decodes them through AVFoundation. It checks timestamp ordering, frame count and codec. It also checks track layouts (single, mix + stems, stems, mix only), that the flash/beep offset in the decoded file is within 20 ms, and that `--system-audio-offset-ms 100` moves audio 100 ms later. The second command additionally captures a real screen with Screen Recording permission. CI publishes the synthetic movies and probe reports as a downloadable workflow artifact. These checks are not a substitute for live-capture sync and performance measurements.
+The first command builds, encodes real synthetic H.264 and HEVC movies through VideoToolbox, and decodes them through AVFoundation. On Windows, `smoke.ps1` also streams synthetic recordings to MediaMTX. It checks the received frames, codec, A/V sync, the mix in a stems-only recording, the silent track in a recording without audio, rejected URLs, and that killing the server ends the stream but not the recording. It checks timestamp ordering, frame count and codec. It also checks track layouts (single, mix + stems, stems, mix only), that the flash/beep offset in the decoded file is within 20 ms, and that `--system-audio-offset-ms 100` moves audio 100 ms later. The second command additionally captures a real screen with Screen Recording permission. CI publishes the synthetic movies and probe reports as a downloadable workflow artifact. These checks are not a substitute for live-capture sync and performance measurements.
 
 ## Windows measurements
 
@@ -121,17 +136,22 @@ One run each on a Windows 11 (26200) PC with an RTX 5070 Ti driving a 3840x2160 
 | Same day, old build `b03e40e` with its original script | Means −25.1 and −23.3 ms |
 | 15 s, 1080p60 H.264, system audio + mic | 900/900 frames; 1.1–2.0 s CPU total (7–13% of one core); peak working set 119 MB |
 | 15 s, native 4K60 HEVC, system audio | 900/900 frames; 0.9–1.0 s CPU total (about 6% of one core); peak working set 116 MB |
+| Live stream, `REC_E2E_STREAM=1` (display + system audio, hardware H.264 at 6 Mb/s to MediaMTX) | Local file: 720/720 frames, 7 pairs, mean −12.3 ms. Received: 719 frames, 7 pairs, mean −12.8 ms, worst 13.5 ms; 0 frames skipped |
+| Same with `REC_E2E_MIC=1` | Local file: 720/720 frames, mean −16.6 ms. Received: 719 frames, 7 pairs, mean −16.5 ms, worst 21.9 ms |
 | `rec.exe` size | 150 KB |
 
-Most of the working set and private memory belongs to the GPU driver's Direct3D allocations, not recorder buffers.
+Most of the working set and private memory belongs to the GPU driver's Direct3D allocations, not recorder buffers. MediaMTX's MP4 writer drops the last received frame, whose duration it cannot know, so received streams have 719 frames.
 
-The live mean moved from about −12 ms on the first day to about −24 ms the next. The build that measured −12 ms measures −24 ms on the same day too, so the move comes from this PC's display or audio path, not from rec. Live offsets on one machine can shift by about 10 ms between sessions.
+One earlier streaming run with the microphone saved a local file that decoded only to 10.7 s (642 of 720 frames, audio cut at the same point), although rec reported 720 frames written and the server received all of them. A Windows Security prompt was dimming the screen during that run. The next run was complete. The cause is not known and it has not been reproduced.
+
+The live mean moved from about −12 ms on the first day to about −24 ms the next morning, and was back at −12 to −17 ms that afternoon. The build that measured −12 ms also measured −24 ms that morning, so the move comes from this PC's display or audio path, not from rec. Live offsets on one machine can shift by about 10 ms between sessions.
 
 ## Current limits
 
 - Capture is display-only.
 - Pausing a live recording on macOS cuts audio per capture buffer (about 10–20 ms), so a sound that spans the pause can leave up to one buffer at the cut. Windows cuts at the exact sample. Neither has been tested with a sound playing at the pause instant.
 - Windows HEVC recordings are not crash-safe (see above).
+- Streaming is Windows-only and plain RTMP. It has not been tested against Twitch or YouTube, at 4K, or over a slow network, and it does not reconnect.
 - Windows loopback captures the default output device. rec plays silence on it while recording so the audio clock keeps moving when nothing else plays.
 - The output latency is read once, when recording starts. Switching output devices mid-recording keeps the old offset.
 - A microphone that is not 48 kHz is resampled linearly per buffer for the mix. Its stem is converted by AVFoundation.

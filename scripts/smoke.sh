@@ -37,10 +37,13 @@ expect_failure 'needs a real screen' record --test-pattern --mic default
 expect_failure 'audio tracks must be' record --audio-tracks surround
 expect_failure 'gain must be' record --mic-gain 99
 expect_failure 'offset must be' record --system-audio-offset-ms 5000
+expect_failure 'stream bitrate must be' record --stream-bitrate 100
 
 if [[ "$(uname -s)" != Darwin ]]; then
   expect_failure 'requires macOS' devices
 else
+  expect_failure 'streaming is not available on macOS yet' record --test-pattern -t 1 \
+    --stream rtmp://127.0.0.1/live/key -o "$tmp/stream.mov"
   # The live A/V sync stimulus must at least compile.
   swiftc -typecheck "$root/scripts/flash-beep.swift"
 

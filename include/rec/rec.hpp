@@ -39,6 +39,9 @@ struct Options {
     std::optional<double> system_audio_offset_ms; // Unset: default output device latency (0 for test tone).
     double mic_offset_ms = 0;
     double duration_seconds = 10.0; // 0 = until stop()
+    // Live stream of the same timeline, encoded separately: rtmp://host[:port]/app/stream-key.
+    std::string stream_url;
+    std::uint32_t stream_kbps = 6000; // Stream video bitrate; audio is 160 kb/s AAC.
 };
 
 struct Display {
@@ -65,6 +68,11 @@ struct Stats {
     double system_audio_offset_ms = 0;
     bool paused = false;
     double paused_seconds = 0; // Total time paused, excluded from the movie.
+    bool streaming = false; // Connected and sending.
+    bool stream_hardware = false; // The stream uses a hardware video encoder.
+    std::uint64_t stream_frames = 0; // Video frames sent to the stream.
+    std::uint64_t stream_dropped = 0; // Video frames the stream skipped to keep up.
+    std::uint64_t stream_bytes = 0;
 };
 
 struct Probe {
@@ -112,6 +120,8 @@ public:
     bool finished() const noexcept; // Duration reached or capture failed.
     Stats stats() const noexcept;
     std::string failure() const;
+    // Why the stream ended early. The recording continues without it.
+    std::string stream_failure() const;
 
 private:
     class Impl;

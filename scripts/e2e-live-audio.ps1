@@ -4,6 +4,8 @@
 # REC_E2E_MIC=1 also records the default microphone (mix + stems).
 # REC_E2E_PAUSE=1 pauses for 2 s in the middle of the stimulus: the movie must keep its
 # full length and stay in sync across the cut.
+# REC_E2E_STREAM=1 also streams to a local MediaMTX server; the stream it records must be
+# in sync too.
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 
@@ -18,6 +20,13 @@ $pause = $env:REC_E2E_PAUSE -eq '1'
 
 $arguments = @('record', '--display', '1', '--system-audio', '-r', '1080p', '-f', '60', '-t', '12', '--codec', 'h264', '-o', $movie)
 if ($env:REC_E2E_MIC -eq '1') { $arguments += @('--mic', 'default') }
+$stream = $env:REC_E2E_STREAM -eq '1'
+$server = $null
+if ($stream) {
+    $received = Join-Path $artifacts 'stream-server'
+    $server = Start-MediaMTX (Get-MediaMTX (Join-Path $root 'build\tools')) $received (Join-Path $artifacts 'mediamtx')
+    $arguments += @('--stream', 'rtmp://127.0.0.1:1935/live/e2e')
+}
 
 Write-Host "Saving recordings and evidence to: $artifacts"
 (Invoke-Rec $rec @('devices')).Text | Tee-Object -FilePath (Join-Path $artifacts 'devices.txt')
@@ -41,7 +50,7 @@ try {
 } finally {
     if ($stimulus -and -not $stimulus.HasExited) { $stimulus.Kill() }
 }
-$result = Stop-RecProcess $run 90
+try { $result = Stop-RecProcess $run 90 } finally { if ($server) { Start-Sleep -Seconds 1; Stop-MediaMTX $server } }
 Set-Content -Path (Join-Path $artifacts 'record.log') -Value $result.Text
 Write-Host $result.Text
 if ($result.Code -ne 0) { throw "Recorder failed; see $artifacts\record.log" }
@@ -59,4 +68,17 @@ if ($events -lt 4) { throw "only $events flash/beep pairs found" }
 Expect-Within $probe 'av_offset_ms' -45 125
 
 Write-Host "Live A/V sync: $events flash/beep pairs, mean offset $($probe['av_offset_ms']) ms (positive = audio late), worst $($probe['av_offset_max_ms']) ms."
+
+if ($stream) {
+    Expect-Text $result.Text 'skipped 0'
+    $file = Get-ChildItem -Recurse -Filter *.mp4 $received | Select-Object -First 1
+    if (-not $file) { throw 'MediaMTX recorded nothing' }
+    $got = Get-Probe $rec $file.FullName (Join-Path $artifacts 'stream-received.probe')
+    Expect-Field $got 'codec' 'h264'
+    Expect-Within $got 'frames' 719 720
+    $pairs = [int]$got['av_sync_events']
+    if ($pairs -lt 4) { throw "only $pairs flash/beep pairs in the received stream" }
+    Expect-Within $got 'av_offset_ms' -45 125
+    Write-Host "Received stream: $($got['frames']) frames, $pairs pairs, mean offset $($got['av_offset_ms']) ms, worst $($got['av_offset_max_ms']) ms."
+}
 Write-Host "Evidence: $artifacts"

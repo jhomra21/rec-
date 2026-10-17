@@ -445,6 +445,7 @@ public:
     Result start() {
         @autoreleasepool {
             if (active_) return {"already recording"};
+            if (!options_.stream_url.empty()) return {"streaming is not available on macOS yet"};
             if (options_.fps == 0 || options_.fps > 120) return {"invalid frame rate"};
             if ((options_.test_tone || options_.test_mic) && !options_.test_pattern)
                 return {"synthetic audio needs the test pattern"};
@@ -1232,5 +1233,6 @@ bool Recorder::running() const noexcept { return impl_->capture.running(); }
 bool Recorder::finished() const noexcept { return impl_->capture.finished(); }
 Stats Recorder::stats() const noexcept { return impl_->capture.stats(); }
 std::string Recorder::failure() const { return impl_->capture.failure(); }
+std::string Recorder::stream_failure() const { return {}; }
 
 } // namespace rec

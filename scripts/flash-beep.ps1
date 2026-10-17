@@ -26,6 +26,7 @@ public static class FlashBeep {
     [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr device);
     [DllImport("winmm.dll")] static extern int waveOutUnprepareHeader(IntPtr device, IntPtr header, uint size);
     [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr device);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
 
     const int Rate = 48000;
     const uint TimeSamples = 2, TimeBytes = 4;
@@ -37,6 +38,8 @@ public static class FlashBeep {
     }
 
     public static void Run(int seconds) {
+        // Without this, display scaling shrinks the "full-screen" window to part of the display.
+        SetProcessDPIAware();
         var pcm = new short[(seconds + 1) * Rate];
         for (int i = 0; i < pcm.Length; ++i)
             if (Beeping(i)) pcm[i] = (short)(Math.Sin(2 * Math.PI * 1000 * i / Rate) * 16000);

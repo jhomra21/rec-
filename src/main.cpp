@@ -133,7 +133,7 @@ void usage() {
                  "Options:\n"
                  "  -o, --output FILE              Output .mp4 or .mov (default: rec.mov)\n"
                  "  --display N                    Display number from devices (default: 1)\n"
-                 "  -r, --resolution SIZE          1080p, 1440p, 4k, or native\n"
+                 "  -r, --resolution SIZE          720p, 1080p, 1440p, 4k, or native\n"
                  "  -f, --fps N                    24, 25, 30, 50, 60, or 120\n"
                  "  -t, --duration SECONDS         Recorded length, excluding pauses (0 = until stopped)\n"
                  "  --codec NAME                   auto, h264, hevc\n"
@@ -146,6 +146,8 @@ void usage() {
                  "  --mic-gain DB                  Microphone level in the mix (-60 to 24)\n"
                  "  --system-audio-offset-ms MS    Delay system audio (default: output device latency)\n"
                  "  --mic-offset-ms MS             Delay the microphone (default: 0)\n"
+                 "  --stream URL                   Also stream live: rtmp://host[:port]/app/stream-key\n"
+                 "  --stream-bitrate KBPS          Stream video kilobits/second (default: 6000)\n"
                  "  --test-pattern                 Synthetic video that flashes once a second\n"
                  "  --test-tone                    Add a beep with each flash as system audio\n"
                  "  --test-mic                     Add a quiet synthetic microphone\n\n"
@@ -188,10 +190,11 @@ bool parse(int argc, char** argv, rec::Options& o, std::string& error) {
             if (!number(value, 0, 86400, o.duration_seconds)) { error = "invalid duration"; return false; }
         } else if (arg == "-r" || arg == "--resolution") {
             if (value == "native") { o.width = o.height = 0; }
+            else if (value == "720p") { o.width = 1280; o.height = 720; }
             else if (value == "1080p") { o.width = 1920; o.height = 1080; }
             else if (value == "1440p") { o.width = 2560; o.height = 1440; }
             else if (value == "4k") { o.width = 3840; o.height = 2160; }
-            else { error = "resolution must be 1080p, 1440p, 4k, or native"; return false; }
+            else { error = "resolution must be 720p, 1080p, 1440p, 4k, or native"; return false; }
         } else if (arg == "--codec") {
             if (value == "auto") o.codec = rec::Codec::automatic;
             else if (value == "h264") o.codec = rec::Codec::h264;
@@ -199,6 +202,13 @@ bool parse(int argc, char** argv, rec::Options& o, std::string& error) {
             else { error = "codec must be auto, h264, or hevc"; return false; }
         } else if (arg == "--bitrate") {
             if (!integer(value, o.bitrate_mbps) || o.bitrate_mbps > 300) { error = "bitrate must be between 0 and 300 Mb/s"; return false; }
+        } else if (arg == "--stream") {
+            if (value.empty()) { error = "--stream needs an rtmp:// URL"; return false; }
+            o.stream_url = value;
+        } else if (arg == "--stream-bitrate") {
+            if (!integer(value, o.stream_kbps) || o.stream_kbps < 500 || o.stream_kbps > 50000) {
+                error = "stream bitrate must be between 500 and 50000 kb/s"; return false;
+            }
         } else if (arg == "--mic") {
             if (value.empty()) { error = "--mic needs a device: default, or an ID or name from `rec devices`"; return false; }
             o.microphone = true;
@@ -239,14 +249,25 @@ bool terminal() {
 #endif
 }
 
+// The stream key is the last path segment; never print it.
+std::string redact(const std::string& url) {
+    const auto last = url.rfind('/');
+    return last == std::string::npos ? url : url.substr(0, last + 1) + "****";
+}
+
 // One rewritten line: elapsed time and anything that needs attention.
-void show_status(const rec::Stats& stats, double recorded, bool audio) {
+void show_status(const rec::Stats& stats, double recorded, bool audio, bool streaming) {
     if (stats.paused) std::cout << "\r\033[33m\xE2\x9D\x9A\xE2\x9D\x9A PAUSED\033[0m ";
     else std::cout << "\r\033[31m\xE2\x97\x8F\033[0m REC    ";
     std::cout << clock_text(recorded) << "   " << stats.written << " frames";
     if (stats.dropped) std::cout << ", \033[33m" << stats.dropped << " dropped\033[0m";
     if (audio && stats.audio_dropped + stats.mic_dropped)
         std::cout << ", \033[33maudio drops " << stats.audio_dropped + stats.mic_dropped << "\033[0m";
+    if (streaming) {
+        if (stats.streaming) std::cout << "   \033[35m\xE2\x97\x8F LIVE\033[0m";
+        else std::cout << "   \033[33mstream lost\033[0m";
+        if (stats.stream_dropped) std::cout << ", \033[33m" << stats.stream_dropped << " skipped\033[0m";
+    }
     std::cout << "\033[K" << std::flush;
 }
 } // namespace
@@ -313,8 +334,15 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     const bool audio = options.system_audio || options.microphone || options.test_tone || options.test_mic;
     const bool live = terminal();
+    const bool streaming = !options.stream_url.empty();
     std::cout << "Recording to " << options.output
-              << (keyboard() ? " (p: pause/resume, q or Ctrl-C: stop)\n" : " (Ctrl-C to stop)\n") << std::flush;
+              << (keyboard() ? " (p: pause/resume, q or Ctrl-C: stop)\n" : " (Ctrl-C to stop)\n");
+    if (streaming) {
+        const auto stats = recorder.stats();
+        std::cout << "Streaming to " << redact(options.stream_url) << " at " << options.stream_kbps << " kb/s ("
+                  << (stats.stream_hardware ? "hardware" : "software") << " H.264)\n";
+    }
+    std::cout << std::flush;
     watch_input();
     const auto began = std::chrono::steady_clock::now();
     auto shown = began - std::chrono::seconds(1);
@@ -337,7 +365,7 @@ int main(int argc, char** argv) {
         }
         const auto now = std::chrono::steady_clock::now();
         if (live && now - shown >= std::chrono::milliseconds(250)) {
-            show_status(recorder.stats(), recorded(), audio);
+            show_status(recorder.stats(), recorded(), audio, streaming);
             shown = now;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -358,8 +386,15 @@ int main(int argc, char** argv) {
     if (stats.mix_written) std::cout << "Mix buffers written " << stats.mix_written << '\n';
     if (stats.paused_seconds > 0)
         std::cout << "Paused " << std::fixed << std::setprecision(1) << stats.paused_seconds << " s (not in the movie)\n";
+    if (streaming)
+        std::cout << "Streamed " << stats.stream_frames << " frames (" << std::fixed << std::setprecision(1)
+                  << static_cast<double>(stats.stream_bytes) / 1e6 << " MB), skipped " << stats.stream_dropped << '\n';
     if (!stopped) { std::cerr << stopped.error << '\n'; return 1; }
     if (!recorder.failure().empty()) { std::cerr << recorder.failure() << '\n'; return 1; }
     std::cout << "Saved " << options.output << '\n';
+    if (const auto lost = recorder.stream_failure(); !lost.empty()) {
+        std::cerr << "Stream stopped early: " << lost << '\n';
+        return 1;
+    }
     return 0;
 }

@@ -1,6 +1,6 @@
 # Windows smoke: build with MSVC, then encode and decode real Media Foundation output.
 # REC_E2E_ARTIFACT_DIR keeps the recordings and probe reports; REC_E2E_CAPTURE=1 also
-# records the real display.
+# records the real display. The streaming check downloads a pinned MediaMTX release.
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 
@@ -117,6 +117,65 @@ try {
     Expect-Within $crash 'frames' 60 120
     Expect-Within $crash 'av_sync_events' 2 4
     Expect-Within $crash 'av_offset_max_ms' 0 20
+    # Live streaming: a local MediaMTX server receives the RTMP stream and records it. The
+    # received file must decode with the frames and A/V sync of the local recording.
+    Expect-Failure 'must start with rtmp://' @('record', '--test-pattern', '-t', '1', '--stream', 'http://127.0.0.1/live/key', '-o', (Join-Path $tmp 'bad-url.mp4'))
+    Expect-Failure 'must look like rtmp://' @('record', '--test-pattern', '-t', '1', '--stream', 'rtmp://127.0.0.1/key', '-o', (Join-Path $tmp 'bad-path.mp4'))
+    Expect-Failure 'could not connect to 127.0.0.1:1' @('record', '--test-pattern', '-t', '1', '--stream', 'rtmp://127.0.0.1:1/live/key', '-o', (Join-Path $tmp 'refused.mp4'))
+    Expect-Failure 'stream bitrate must be' @('record', '--stream-bitrate', '100')
+    $mediamtx = Get-MediaMTX (Join-Path $root 'build\tools')
+    $received = Join-Path $artifacts 'stream-server'
+    $server = Start-MediaMTX $mediamtx $received (Join-Path $tmp 'mediamtx')
+    try {
+        # Stem-only file: the stream still carries the mix.
+        $live = Record 'stream' 'stream-local.mp4' @('--test-pattern', '--test-tone', '--test-mic', '--audio-tracks', 'stems',
+            '-r', '720p', '-f', '30', '-t', '4', '--stream', 'rtmp://127.0.0.1:1935/live/smokekey1')
+        Expect-Text $live.Log 'Streaming to rtmp://127.0.0.1:1935/live/****'
+        Expect-Text $live.Log 'Streamed 120 frames'
+        Expect-Text $live.Log 'skipped 0'
+        if ($live.Log.Contains('smokekey1')) { throw 'the stream key was printed' }
+        Expect-Field $live.Probe 'audio_tracks' '2'
+        # MediaMTX analyzes 2 s of media before it records, so streams here run longer than that.
+        $silent = Record 'stream-silent' 'stream-silent-local.mp4' @('--test-pattern', '-r', '720p', '-f', '30', '-t', '3',
+            '--stream', 'rtmp://127.0.0.1:1935/live/smokekey2')
+        Expect-Text $silent.Log 'Streamed 90 frames'
+
+        # Losing the server ends the stream, not the recording.
+        $lostPath = Join-Path $artifacts 'stream-lost.mp4'
+        $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '-r', '720p', '-f', '30', '-t', '4',
+            '--stream', 'rtmp://127.0.0.1:1935/live/smokekey3', '-o', $lostPath)
+        Start-Sleep -Seconds 2
+        Stop-MediaMTX $server
+        $lost = Stop-RecProcess $run
+        Set-Content -Path (Join-Path $artifacts 'stream-lost.record.log') -Value $lost.Text
+        Write-Host $lost.Text
+        if ($lost.Code -eq 0) { throw 'a lost stream was not reported' }
+        Expect-Text $lost.Text 'Stream stopped early'
+        Expect-Text $lost.Text 'written 120, dropped 0'
+        if ($lost.Text -match 'Streamed 120 frames') { throw 'frames after the loss were counted as streamed' }
+        Expect-Field (Get-Probe $rec $lostPath (Join-Path $artifacts 'stream-lost.probe')) 'frames' '120'
+    } finally {
+        Stop-MediaMTX $server
+    }
+    $files = @{}
+    foreach ($key in 'smokekey1', 'smokekey2') {
+        $file = Get-ChildItem -Recurse -Filter *.mp4 (Join-Path $received "live\$key") | Select-Object -First 1
+        if (-not $file) { throw "MediaMTX recorded nothing for $key" }
+        $files[$key] = Get-Probe $rec $file.FullName (Join-Path $artifacts "stream-received-$key.probe")
+    }
+    $got = $files['smokekey1']
+    Expect-Field $got 'codec' 'h264'
+    Expect-Field $got 'width' '1280'
+    Expect-Field $got 'height' '720'
+    # MediaMTX's MP4 writer drops the final frame, whose duration it cannot know.
+    Expect-Within $got 'frames' 119 120
+    Expect-Field $got 'audio_tracks' '1'
+    Expect-Field $got 'audio_codec' 'aac'
+    Expect-Within $got 'audio_duration' 3.9 4.05
+    Expect-Within $got 'av_sync_events' 4 4
+    Expect-Within $got 'av_offset_max_ms' 0 20
+    Expect-Within $files['smokekey2'] 'frames' 89 90
+    Expect-Field $files['smokekey2'] 'audio_codec' 'aac'
     # HEVC needs a hardware encoder or the HEVC Video Extensions; GPU-less CI runners have neither.
     $hevcPath = Join-Path $artifacts 'hevc.mp4'
     $hevcRun = Invoke-Rec $rec @('record', '--test-pattern', '-r', '1080p', '-f', '30', '-t', '1', '--codec', 'hevc', '-o', $hevcPath)
