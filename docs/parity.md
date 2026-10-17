@@ -1,0 +1,70 @@
+# rec-rs parity and E2E acceptance
+
+Full parity with `michaelshimeles/rec-rs` is the product goal. This is a living acceptance inventory, not a list of implemented features. A feature is **verified** only after running it end to end on the named platform (macOS is primary; Windows is tracked alongside) and inspecting the saved result or observable behavior. Do not check off a feature because it compiles or because an internal helper succeeds.
+
+## Capture and output
+
+| Capability | State | Required acceptance |
+| --- | --- | --- |
+| Display capture | Verified on macOS (M3 Pro, 30/60 fps, 0 drops; presets keep the display's aspect, so 1080p gives 1670x1080 there) and Windows (WGC, 4K display at 30/60 fps, 0 drops) | 30/60 fps on physical display, correct dimensions and output frames |
+| Window capture | Missing | Resize, occlusion, title/ID selection, minimize/reopen |
+| Region capture | Missing | Retina coordinate mapping, crop boundaries, no stretching |
+| Native resolution and presets | Implemented, quality unverified | Native/1080p/1440p/4K on 16:9 and 16:10 displays |
+| 24/25/30/50/60/120 fps | Implemented, real-capture verification pending | Exact frame grid, refresh-rate/encoder limits handled |
+| H.264/HEVC MOV/MP4 | Synthetic E2E verified on macOS; synthetic and live verified on Windows (Media Foundation, ISO MP4 structure for .mov) | Encode, finalize, full decode and frame-count verification |
+| ProRes 422 | Missing | MOV, quality and file-size inspection |
+| GPU Lanczos scaling | Missing | Native 5K capture vs output, GPU residency, image-quality comparison |
+| System audio | Live flash/beep verified. macOS (SCK, 28 ms output-latency offset): two runs, means +24.3 and +25.6 ms, worst 38.9 ms. Windows (WASAPI loopback): mean −12.8 ms, worst 13.3 ms | `scripts/e2e-live-audio.sh` / `.ps1`: flash/beep offset within ITU window; drift, overload, sleep and device changes |
+| Microphone | Live 3-track runs pass on both. macOS: 14 runs, means +20.8 to +36.2 ms; since `8cfe365`, 10/10 runs with 6/6 pairs and 0 dropped buffers (start-up pre-roll is drained before drops count). Windows: USB interface, mean −11.9 ms, 0 drops | `REC_E2E_MIC=1` live script; mono/stereo input, 44.1 kHz device, disconnect/reconnect |
+| Mixed audio and separate stems | Synthetic and live mix + stems verified on macOS and Windows | Gain, limiter, offsets, gap handling verified live; tracks import into an editor |
+| Single-clock A/V sync | Timestamp-accurate CFR grid, host-clock audio; synthetic offset < 20 ms; live 12 s runs within 43.7 ms (macOS) and 17.2 ms (Windows) | 30-minute drift |
+| Camera capture and overlays | Missing | Cold-start exposure, device selection, hot-plug, masks and transforms |
+| Pause/resume | Implemented on both (API, keys, piped stdin). Synthetic 1.5 s pause passes on macOS CI and Windows (90/90 frames, 3 tracks, sync ≤ 10.8 ms). Live 2 s pause with system audio + mic: macOS 720/720 frames, 6/6 remaining pairs, mean +24.4 ms, worst 36.6 ms; Windows 720/720 frames, worst 27.9 ms (`REC_E2E_PAUSE=1` in both live scripts) | Pause while a sound plays (macOS cuts per capture buffer); repeated pauses in one recording; pause during encoder backpressure |
+| Fragmented/crash-safe output | macOS: 1 s movie fragments, consolidated on finish. Windows: fragmented MP4 for H.264 (HEVC not crash-safe). Hard kill decodes with sync on macOS CI, a Mac (kill -9 of a live recording at 5 s kept 4.0 s, up to the last fragment) and Windows | Power loss on real hardware; Windows HEVC; players other than AVFoundation and Media Foundation |
+| Cursor and click indicators | Partial | Cursor visible/hidden, scale and click overlay |
+| Synthetic video + tone E2E | Passed on macOS CI and on a Mac; passed locally on Windows | Encoded movies + complete decoder probe saved as CI artifacts |
+| Synthetic flash/beep sync, mixer and track layouts | Passed on macOS CI; passed locally on Windows | Measured offset, offset flag, 1/2/3-track layouts in decoded files |
+
+## Replay and live output
+
+| Capability | State | Required acceptance |
+| --- | --- | --- |
+| Replay buffer (15–300 s) | Missing | Keyframe-safe save without stopping the capture |
+| RTMP and RTMPS | RTMP implemented on both: rec's own client (handshake, AMF0, chunking, FLV H.264/AAC), `--stream`. Verified against MediaMTX v1.21.2, which records what it receives. Windows synthetic (CI and local): 119/120 frames received, 4 pairs, worst 10.8 ms; mix sent with a stems-only file; silent AAC without audio sources; killing the server keeps the recording. Windows live with hardware H.264: 719/720 frames received, 7 pairs, worst 21.9 ms (`REC_E2E_STREAM=1`). macOS synthetic (CI, VideoToolbox hardware H.264): the same checks pass, 119/120 frames received, 4 pairs. Through AVFoundation the received file reads −31.9 ms mean, 42.5 ms worst, which matches AVFoundation trimming 44 ms of AAC priming from a file without an edit list. The same file probed on Windows reads +2.6 ms mean, 10.0 ms worst. macOS live streaming is not yet tested. RTMPS and reconnect missing | Twitch/YouTube ingest, RTMPS, reconnect, 4K stream, slow-network keyframe skipping, long pauses |
+| WHIP/WebRTC | Missing | Server handshake, ICE/DTLS/SRTP, A/V sync, cleanup |
+| Shared live encoder | Partial on both: one stream encoder (H.264 + AAC) beside the file encoder, fed the same frames and program audio. No replay buffer or second stream uses it yet | Replay and simultaneous streams share one encode |
+| Stream keys in Keychain | Missing. The CLI prints `rtmp://host/app/****` and smoke checks that the key is not printed, but the key is visible in the process arguments | No keys in logs/settings, revoke and replace |
+| Capture survives GUI close | Missing | Recording, replay and streams continue headless |
+
+## Application experience
+
+| Capability | State | Required acceptance |
+| --- | --- | --- |
+| Native app and live preview | Missing | Composited preview matches export, minimal idle work |
+| Scene presets and switching | Missing | Screen, screen+cam and camera switching without stopping |
+| Floating camera layout controls | Missing | Drag/snap, circle/rounded/square/pill/squircle, border/shadow |
+| Audio meters | Missing | Per-source peak meters, no render work while hidden |
+| CLI recording status | Implemented (TTY only): recorded time, PAUSED, drops | Elapsed time and drops visible while recording |
+| Menu bar and Dock behavior | Missing | Start/pause/stop/save/quit, finalized file on exit |
+| Global hotkeys | Missing | Registered/unregistered safely, conflicts visible |
+| Settings persistence | Missing | No recording corruption on invalid/stale settings |
+| Device/permission diagnostics | Partial | Useful errors and permission recovery in the app |
+| File reveal and quick actions | Missing | One-click reveal, last recording, retry, sensible paths |
+
+## Joyful UI guidelines
+
+- Recording status must be unmistakable. A clear timer, accessible stop control, and visible audio activity matter more than decoration.
+- Show the exact output: the same composition and crop as the saved movie. No surprises when exporting.
+- Make the fast path one action: choose a screen or window, record, stop, reveal.
+- Keep controls responsive and keyboard-friendly. Use short, purposeful motion with a reduced-motion option. No animated UI should run while hidden.
+- Treat failure as recoverable: state the missing permission or device, keep already recorded data, and give the user the next useful action.
+- Do not charge memory for dormant features: inactive camera, hidden preview, replay-disabled buffer, and streaming-disabled networking must not allocate sustained runtime resources.
+
+## Verification rules
+
+1. CLI and native UI must call the same recorder core. Do not reimplement capture or writer logic in the frontend.
+2. Prefer E2E validation; do not add unit tests. Any CI check of behavior must produce a repeatable output artifact.
+3. Synthetic E2E must produce H.264 MOV and HEVC MP4, retain the files, decode every frame with the platform decoder (AVFoundation or Media Foundation), verify monotonic timestamps, frame count, codec, and no overwrite.
+4. On a permissioned Mac, test real screen/window/camera/audio recordings including stop, cancellation, device unplug, sleep/wake, display change, 30-minute soak, and SIGTERM.
+5. Compare against rec-rs using the same Mac, screen contents, codec, resolution, frame rate, and duration. Collect process RSS, CPU, frame drops, quality, binary and app size. Separate hardware-encoder and WindowServer resource usage from process RSS/CPU.
+6. Keep this list honest. Compiler success is not recording parity; synthetic recording is not proof of ScreenCaptureKit behavior; CPU/RAM improvements are claims only after paired benchmarks.

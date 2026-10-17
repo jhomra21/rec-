@@ -1,0 +1,26 @@
+#include "rec/rec.hpp"
+
+namespace rec {
+std::vector<Display> list_displays(std::string& error) {
+    error = "screen capture requires macOS 15 or Windows 10 (1903) or newer";
+    return {};
+}
+std::vector<AudioDevice> list_microphones(std::string& error) {
+    error = "microphone capture requires macOS 15 or Windows 10 (1903) or newer";
+    return {};
+}
+double default_output_latency_ms() noexcept { return 0; }
+Result probe_file(const std::string&, Probe&) { return {"probing recordings requires macOS or Windows"}; }
+class Recorder::Impl {};
+Recorder::Recorder(Options) : impl_(std::make_unique<Impl>()) {}
+Recorder::~Recorder() = default;
+Result Recorder::start() { return {"screen capture requires macOS 15 or Windows 10 (1903) or newer"}; }
+Result Recorder::stop() { return {}; }
+Result Recorder::pause() { return {"not recording"}; }
+Result Recorder::resume() { return {"not recording"}; }
+bool Recorder::running() const noexcept { return false; }
+bool Recorder::finished() const noexcept { return true; }
+Stats Recorder::stats() const noexcept { return {}; }
+std::string Recorder::failure() const { return {}; }
+std::string Recorder::stream_failure() const { return {}; }
+} // namespace rec

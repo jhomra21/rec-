@@ -1,0 +1,204 @@
+# Windows smoke: build with MSVC, then encode and decode real Media Foundation output.
+# REC_E2E_ARTIFACT_DIR keeps the recordings and probe reports; REC_E2E_CAPTURE=1 also
+# records the real display. The streaming check downloads a pinned MediaMTX release.
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'windows-common.ps1')
+
+$root = Split-Path -Parent $PSScriptRoot
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('rec-smoke-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force $tmp | Out-Null
+$artifacts = if ($env:REC_E2E_ARTIFACT_DIR) { $env:REC_E2E_ARTIFACT_DIR } else { $tmp }
+New-Item -ItemType Directory -Force $artifacts | Out-Null
+
+try {
+    $rec = Build-Rec $root (Join-Path $tmp 'build')
+
+    function Expect-Failure([string]$pattern, [string[]]$arguments) {
+        $run = Invoke-Rec $rec $arguments
+        if ($run.Code -eq 0) { throw "accepted: rec $arguments" }
+        if (-not $run.Text.Contains($pattern)) { throw "rec $arguments printed '$($run.Text)', expected '$pattern'" }
+    }
+    function Record([string]$name, [string]$file, [string[]]$arguments) {
+        $path = Join-Path $artifacts $file
+        $run = Invoke-Rec $rec (@('record') + $arguments + @('-o', $path))
+        Set-Content -Path (Join-Path $artifacts "$name.record.log") -Value $run.Text
+        Write-Host $run.Text
+        if ($run.Code -ne 0) { throw "rec record $arguments failed" }
+        $probe = Get-Probe $rec $path (Join-Path $artifacts "$name.probe")
+        return @{ Log = $run.Text; Probe = $probe }
+    }
+
+    if (-not (Invoke-Rec $rec @('--help')).Text.Contains('native screen recorder')) { throw 'help text' }
+    Expect-Failure 'fps must be' @('record', '--fps', 'invalid')
+    Expect-Failure 'resolution must be' @('record', '--resolution', 'gigantic')
+    Expect-Failure 'requires --test-pattern' @('record', '--test-tone')
+    Expect-Failure 'requires --test-pattern' @('record', '--test-mic')
+    Expect-Failure 'needs a real screen' @('record', '--test-pattern', '--system-audio')
+    Expect-Failure 'needs a real screen' @('record', '--test-pattern', '--mic', 'default')
+    Expect-Failure 'audio tracks must be' @('record', '--audio-tracks', 'surround')
+    Expect-Failure 'gain must be' @('record', '--mic-gain', '99')
+    Expect-Failure 'offset must be' @('record', '--system-audio-offset-ms', '5000')
+
+    # The live A/V sync stimulus must at least compile.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'flash-beep.ps1') -CheckOnly
+    if ($LASTEXITCODE -ne 0) { throw 'flash-beep.ps1 does not compile' }
+
+    # Media Foundation encode and decode without capture.
+    $h264 = Record 'h264' 'h264.mp4' @('--test-pattern', '-r', '1080p', '-f', '30', '-t', '2', '--codec', 'h264')
+    Expect-Field $h264.Probe 'codec' 'h264'
+    Expect-Field $h264.Probe 'width' '1920'
+    Expect-Field $h264.Probe 'height' '1080'
+    Expect-Field $h264.Probe 'frames' '60'
+    Expect-Field $h264.Probe 'audio_tracks' '0'
+    Expect-Text $h264.Log 'written 60, dropped 0'
+
+    # Flash + beep through the AAC encoder: measured A/V offset in the decoded file.
+    $av = Record 'av' 'av.mp4' @('--test-pattern', '--test-tone', '-r', '1080p', '-f', '30', '-t', '2', '--codec', 'h264')
+    Expect-Field $av.Probe 'frames' '60'
+    Expect-Field $av.Probe 'audio_tracks' '1'
+    Expect-Field $av.Probe 'audio_codec' 'aac'
+    Expect-Text $av.Log 'written 60, dropped 0'
+    Expect-Within $av.Probe 'audio_duration' 1.95 2.05
+    Expect-Within $av.Probe 'av_sync_events' 2 2
+    Expect-Within $av.Probe 'av_offset_max_ms' 0 20
+
+    # A system-audio offset moves audio later by exactly that much.
+    $offset = Record 'offset' 'offset.mp4' @('--test-pattern', '--test-tone', '--system-audio-offset-ms', '100', '-f', '30', '-t', '2')
+    Expect-Within $offset.Probe 'av_sync_events' 2 2
+    Expect-Within $offset.Probe 'av_offset_ms' 80 120
+
+    # Mixer: default track is the system + mic mix, followed by both stems.
+    $mix = Record 'mix' 'mix.mov' @('--test-pattern', '--test-tone', '--test-mic', '-f', '30', '-t', '2')
+    Expect-Field $mix.Probe 'audio_tracks' '3'
+    Expect-Field $mix.Probe 'audio_codec' 'aac'
+    Expect-Text $mix.Log 'Mix buffers written'
+    Expect-Text $mix.Log 'written 60, dropped 0'
+    Expect-Within $mix.Probe 'audio_duration' 1.95 2.05
+    Expect-Within $mix.Probe 'av_sync_events' 2 2
+    Expect-Within $mix.Probe 'av_offset_max_ms' 0 20
+
+    $stems = Record 'stems' 'stems.mp4' @('--test-pattern', '--test-tone', '--test-mic', '--audio-tracks', 'stems', '-f', '30', '-t', '1')
+    Expect-Field $stems.Probe 'audio_tracks' '2'
+    $mixonly = Record 'mixonly' 'mixonly.mp4' @('--test-pattern', '--test-tone', '--test-mic', '--audio-tracks', 'mix', '-f', '30', '-t', '1')
+    Expect-Field $mixonly.Probe 'audio_tracks' '1'
+
+    # Pause/resume through piped stdin: paused time is cut from the movie, A/V stays in sync.
+    $pausePath = Join-Path $artifacts 'pause.mp4'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '--test-mic', '-f', '30', '-t', '3', '-o', $pausePath)
+    Start-Sleep -Milliseconds 1000
+    Send-RecCommand $run 'pause'
+    Start-Sleep -Milliseconds 1500
+    Send-RecCommand $run 'resume'
+    $paused = Stop-RecProcess $run
+    $watch.Stop()
+    Set-Content -Path (Join-Path $artifacts 'pause.record.log') -Value $paused.Text
+    Write-Host $paused.Text
+    if ($paused.Code -ne 0) { throw "paused recording failed: $($paused.Text)" }
+    Expect-Text $paused.Text 'Paused at'
+    Expect-Text $paused.Text 'Resumed at'
+    Expect-Text $paused.Text 'written 90, dropped 0'
+    Expect-Text $paused.Text 'not in the movie'
+    if ($watch.Elapsed.TotalSeconds -lt 4.2) { throw "pause did not hold the recording ($($watch.Elapsed.TotalSeconds) s)" }
+    $pause = Get-Probe $rec $pausePath (Join-Path $artifacts 'pause.probe')
+    Expect-Field $pause 'frames' '90'
+    Expect-Field $pause 'audio_tracks' '3'
+    Expect-Within $pause 'audio_duration' 2.95 3.05
+    Expect-Within $pause 'av_sync_events' 3 3
+    Expect-Within $pause 'av_offset_max_ms' 0 20
+
+    # Crash safety: a recording killed mid-write still decodes up to its last fragment.
+    $crashPath = Join-Path $artifacts 'crash.mp4'
+    $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '-f', '30', '-t', '0', '--codec', 'h264', '-o', $crashPath)
+    Start-Sleep -Seconds 4
+    $run.Process.Kill()
+    $run.Process.WaitForExit()
+    $crash = Get-Probe $rec $crashPath (Join-Path $artifacts 'crash.probe')
+    Expect-Within $crash 'frames' 60 120
+    Expect-Within $crash 'av_sync_events' 2 4
+    Expect-Within $crash 'av_offset_max_ms' 0 20
+    # Live streaming: a local MediaMTX server receives the RTMP stream and records it. The
+    # received file must decode with the frames and A/V sync of the local recording.
+    Expect-Failure 'must start with rtmp://' @('record', '--test-pattern', '-t', '1', '--stream', 'http://127.0.0.1/live/key', '-o', (Join-Path $tmp 'bad-url.mp4'))
+    Expect-Failure 'must look like rtmp://' @('record', '--test-pattern', '-t', '1', '--stream', 'rtmp://127.0.0.1/key', '-o', (Join-Path $tmp 'bad-path.mp4'))
+    Expect-Failure 'could not connect to 127.0.0.1:1' @('record', '--test-pattern', '-t', '1', '--stream', 'rtmp://127.0.0.1:1/live/key', '-o', (Join-Path $tmp 'refused.mp4'))
+    Expect-Failure 'stream bitrate must be' @('record', '--stream-bitrate', '100')
+    $mediamtx = Get-MediaMTX (Join-Path $root 'build\tools')
+    $received = Join-Path $artifacts 'stream-server'
+    $server = Start-MediaMTX $mediamtx $received (Join-Path $tmp 'mediamtx')
+    try {
+        # Stem-only file: the stream still carries the mix.
+        $live = Record 'stream' 'stream-local.mp4' @('--test-pattern', '--test-tone', '--test-mic', '--audio-tracks', 'stems',
+            '-r', '720p', '-f', '30', '-t', '4', '--stream', 'rtmp://127.0.0.1:1935/live/smokekey1')
+        Expect-Text $live.Log 'Streaming to rtmp://127.0.0.1:1935/live/****'
+        Expect-Text $live.Log 'Streamed 120 frames'
+        Expect-Text $live.Log 'skipped 0'
+        if ($live.Log.Contains('smokekey1')) { throw 'the stream key was printed' }
+        Expect-Field $live.Probe 'audio_tracks' '2'
+        # MediaMTX analyzes 2 s of media before it records, so streams here run longer than that.
+        $silent = Record 'stream-silent' 'stream-silent-local.mp4' @('--test-pattern', '-r', '720p', '-f', '30', '-t', '3',
+            '--stream', 'rtmp://127.0.0.1:1935/live/smokekey2')
+        Expect-Text $silent.Log 'Streamed 90 frames'
+
+        # Losing the server ends the stream, not the recording.
+        $lostPath = Join-Path $artifacts 'stream-lost.mp4'
+        $run = Start-RecProcess $rec @('record', '--test-pattern', '--test-tone', '-r', '720p', '-f', '30', '-t', '4',
+            '--stream', 'rtmp://127.0.0.1:1935/live/smokekey3', '-o', $lostPath)
+        Start-Sleep -Seconds 2
+        Stop-MediaMTX $server
+        $lost = Stop-RecProcess $run
+        Set-Content -Path (Join-Path $artifacts 'stream-lost.record.log') -Value $lost.Text
+        Write-Host $lost.Text
+        if ($lost.Code -eq 0) { throw 'a lost stream was not reported' }
+        Expect-Text $lost.Text 'Stream stopped early'
+        Expect-Text $lost.Text 'written 120, dropped 0'
+        if ($lost.Text -match 'Streamed 120 frames') { throw 'frames after the loss were counted as streamed' }
+        Expect-Field (Get-Probe $rec $lostPath (Join-Path $artifacts 'stream-lost.probe')) 'frames' '120'
+    } finally {
+        Stop-MediaMTX $server
+    }
+    $files = @{}
+    foreach ($key in 'smokekey1', 'smokekey2') {
+        $file = Get-ChildItem -Recurse -Filter *.mp4 (Join-Path $received "live\$key") | Select-Object -First 1
+        if (-not $file) { throw "MediaMTX recorded nothing for $key" }
+        $files[$key] = Get-Probe $rec $file.FullName (Join-Path $artifacts "stream-received-$key.probe")
+    }
+    $got = $files['smokekey1']
+    Expect-Field $got 'codec' 'h264'
+    Expect-Field $got 'width' '1280'
+    Expect-Field $got 'height' '720'
+    # MediaMTX's MP4 writer drops the final frame, whose duration it cannot know.
+    Expect-Within $got 'frames' 119 120
+    Expect-Field $got 'audio_tracks' '1'
+    Expect-Field $got 'audio_codec' 'aac'
+    Expect-Within $got 'audio_duration' 3.9 4.05
+    Expect-Within $got 'av_sync_events' 4 4
+    Expect-Within $got 'av_offset_max_ms' 0 20
+    Expect-Within $files['smokekey2'] 'frames' 89 90
+    Expect-Field $files['smokekey2'] 'audio_codec' 'aac'
+    # HEVC needs a hardware encoder or the HEVC Video Extensions; GPU-less CI runners have neither.
+    $hevcPath = Join-Path $artifacts 'hevc.mp4'
+    $hevcRun = Invoke-Rec $rec @('record', '--test-pattern', '-r', '1080p', '-f', '30', '-t', '1', '--codec', 'hevc', '-o', $hevcPath)
+    if ($hevcRun.Code -ne 0 -and $hevcRun.Text.Contains('HEVC encoder')) {
+        Write-Host "HEVC skipped: $($hevcRun.Text)"
+    } else {
+        if ($hevcRun.Code -ne 0) { throw "HEVC recording failed: $($hevcRun.Text)" }
+        $hevc = Get-Probe $rec $hevcPath (Join-Path $artifacts 'hevc.probe')
+        Expect-Field $hevc 'codec' 'hevc'
+        Expect-Field $hevc 'height' '1080'
+        Expect-Field $hevc 'frames' '30'
+        Expect-Text $hevcRun.Text 'written 30, dropped 0'
+    }
+
+    Expect-Failure 'already exists' @('record', '--test-pattern', '-t', '1', '-o', (Join-Path $artifacts 'h264.mp4'))
+    Expect-Field (Get-Probe $rec (Join-Path $artifacts 'h264.mp4') (Join-Path $tmp 'recheck.probe')) 'frames' '60'
+
+    if ($env:REC_E2E_CAPTURE -eq '1') {
+        $screen = Record 'screen' 'screen.mp4' @('--display', '1', '-r', '1080p', '-f', '30', '-t', '3', '--codec', 'h264')
+        Expect-Field $screen.Probe 'codec' 'h264'
+        Expect-Field $screen.Probe 'frames' '90'
+    }
+    Write-Host 'smoke passed'
+} finally {
+    if ($artifacts -ne $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+}
