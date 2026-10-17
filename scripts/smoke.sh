@@ -166,9 +166,14 @@ else
   within "$(value frames "$got")" 119 120
   grep -qx 'audio_tracks=1' "$got"
   grep -qx 'audio_codec=aac' "$got"
-  within "$(value audio_duration "$got")" 3.9 4.05
+  # MediaMTX writes no edit list, and AVFoundation then reads the audio 44 ms (2112 frames,
+  # AAC's usual encoder delay) shorter and earlier than decoders that keep the priming, such
+  # as Media Foundation and FFmpeg. The stream is timed for those: a CI file from this check
+  # probed on Windows at +2.6 ms mean, 10 ms worst. So here the bounds allow for the 44 ms.
+  within "$(value audio_duration "$got")" 3.8 4.05
   within "$(value av_sync_events "$got")" 4 4
-  within "$(value av_offset_max_ms "$got")" 0 20
+  within "$(value av_offset_ms "$got")" -55 10
+  within "$(value av_offset_max_ms "$got")" 0 55
   within "$(value frames "$artifacts/stream-received-smokekey2.probe")" 89 90
   grep -qx 'audio_codec=aac' "$artifacts/stream-received-smokekey2.probe"
   "$rec" record --test-pattern -r 1080p -f 30 -t 1 --codec hevc -o "$artifacts/hevc.mp4" | tee "$artifacts/hevc.record.log"
